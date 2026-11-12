@@ -1,0 +1,4 @@
+config C6_XBT
+    bool "XBT: Bluedroid host on the C6 over the P4's USB Bluetooth dongle"
+    default n
+    select ESP_HOSTED_CP_FEAT_PEER_DATA

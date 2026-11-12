@@ -1,0 +1,2712 @@
+diff --git a/esphome/components/esp32_hosted/__init__.py b/esphome/components/esp32_hosted/__init__.py
+index 793a7424d3..064b3be623 100644
+--- a/esphome/components/esp32_hosted/__init__.py
++++ b/esphome/components/esp32_hosted/__init__.py
+@@ -50,14 +50,14 @@ CONF_SPI_MODE = "spi_mode"
+ # CONFIG_IDF_TARGET_ESP32P4 so it compiles to nothing on hosts with a native
+ # ESP-NOW stack. CustomRpc needs these two host-side Kconfig options. Host
+ # registers 3 handlers (RESP, RECV, SEND); the coprocessor registers 1 (REQ);
+-# we ask for 8 to leave room for other CustomRpc extensions alongside.
++# we ask for 16 to leave room for other CustomRpc extensions alongside.
+ #
+ # The coprocessor must run the matching custom firmware (a parallel effort in
+ # esphome/esp-hosted-firmware). esp_now_hosted_rpc.h here is the canonical copy
+ # of the wire contract and MUST stay byte-identical to the copy that coprocessor
+ # firmware uses — the packed structs are the on-wire layout, so any divergence
+ # silently corrupts every ESP-NOW frame.
+-_MAX_CUSTOM_MSG_HANDLERS = 8
++_MAX_CUSTOM_MSG_HANDLERS = 16
+ 
+ # Shared fields for both transport modes
+ BASE_SCHEMA = cv.Schema(
+diff --git a/esphome/components/esp32_hosted/update/__init__.py b/esphome/components/esp32_hosted/update/__init__.py
+index 76c0c3f090..323e10b662 100644
+--- a/esphome/components/esp32_hosted/update/__init__.py
++++ b/esphome/components/esp32_hosted/update/__init__.py
+@@ -7,32 +7,63 @@ from typing import Any
+ 
+ import voluptuous as vol
+ 
+-from esphome import external_files
++from esphome import automation, external_files, pins
+ import esphome.codegen as cg
+-from esphome.components import esp32, update
++from esphome.components import esp32, network, update
+ from esphome.components.const import CONF_SHA256
+ import esphome.config_validation as cv
+-from esphome.const import CONF_ID, CONF_PATH, CONF_SOURCE, CONF_TYPE, CONF_URL
++from esphome.const import (
++    CONF_BAUD_RATE,
++    CONF_ID,
++    CONF_PATH,
++    CONF_RX_PIN,
++    CONF_SOURCE,
++    CONF_TX_PIN,
++    CONF_TYPE,
++    CONF_URL,
++)
+ from esphome.core import CORE, ID, HexInt
+ from esphome.types import ConfigType
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
+ CODEOWNERS = ["@swoboda1337"]
+-AUTO_LOAD = ["sha256", "watchdog", "json"]
+ DEPENDENCIES = ["esp32_hosted"]
+ 
+ CONF_HTTP_REQUEST_ID = "http_request_id"
++CONF_SERIAL = "serial"
++CONF_UART_NUM = "uart_num"
++CONF_BOOT_PIN = "boot_pin"
++CONF_ENABLED = "enabled"
++CONF_SAFE_MODE_ID = "safe_mode_id"
++CONF_ON_PROGRESS = "on_progress"
+ 
+ TYPE_EMBEDDED = "embedded"
+ TYPE_HTTP = "http"
++TYPE_STORAGE = "storage"
++
++
++def AUTO_LOAD(config: ConfigType) -> list[str]:
++    """sha256/watchdog/json are always needed; the storage firmware source additionally needs
++    the storage component, pulled in only when 'type: storage' is selected — other sources pay
++    nothing for it."""
++    base = ["sha256", "watchdog", "json"]
++    if config and CONF_SERIAL in config:
++        base = base + ["md5"]
++    if config and config.get(CONF_TYPE) == TYPE_STORAGE:
++        return base + ["storage"]
++    return base
+ 
+ esp32_hosted_ns = cg.esphome_ns.namespace("esp32_hosted")
+ http_request_ns = cg.esphome_ns.namespace("http_request")
+ HttpRequestComponent = http_request_ns.class_("HttpRequestComponent", cg.Component)
++UpdateMethod = esp32_hosted_ns.enum("UpdateMethod", is_class=True)
+ Esp32HostedUpdate = esp32_hosted_ns.class_(
+     "Esp32HostedUpdate", update.UpdateEntity, cg.PollingComponent
+ )
++SafeModeComponent = cg.esphome_ns.namespace("safe_mode").class_(
++    "SafeModeComponent", cg.Component
++)
+ 
+ 
+ def _validate_sha256(value: Any) -> str:
+@@ -46,8 +77,29 @@ def _validate_sha256(value: Any) -> str:
+     return value
+ 
+ 
+-BASE_SCHEMA = update.update_schema(Esp32HostedUpdate, device_class="firmware").extend(
+-    cv.polling_component_schema("6h")
++SERIAL_SCHEMA = cv.Schema(
++    {
++        cv.Required(CONF_UART_NUM): cv.int_range(min=1, max=4),
++        cv.Required(CONF_TX_PIN): pins.internal_gpio_output_pin_number,
++        cv.Required(CONF_RX_PIN): pins.internal_gpio_input_pin_number,
++        cv.Required(CONF_BOOT_PIN): pins.internal_gpio_output_pin_number,
++        cv.Optional(CONF_BAUD_RATE, default=460800): cv.int_range(
++            min=115200, max=2000000
++        ),
++        cv.Optional(CONF_ENABLED, default=False): cv.boolean,
++    }
++)
++
++BASE_SCHEMA = (
++    update.update_schema(Esp32HostedUpdate, device_class="firmware")
++    .extend(cv.polling_component_schema("6h"))
++    .extend(
++        {
++            cv.Optional(CONF_SERIAL): SERIAL_SCHEMA,
++            cv.OnlyWith(CONF_SAFE_MODE_ID, "safe_mode"): cv.use_id(SafeModeComponent),
++            cv.Optional(CONF_ON_PROGRESS): automation.validate_automation({}),
++        }
++    )
+ )
+ 
+ EMBEDDED_SCHEMA = cv.All(
+@@ -68,11 +120,31 @@ HTTP_SCHEMA = BASE_SCHEMA.extend(
+     }
+ )
+ 
++# Read the co-processor firmware from a mounted storage at runtime. CONF_SOURCE is a plain
++# storage path (e.g. /sdcard/slave_fw.bin) resolved through the storage registry — not a URL and
++# not a build-time file, so it is validated as a string and never opened during config.
++def _validate_storage_source(config: ConfigType) -> ConfigType:
++    if not config[CONF_SOURCE].lower().endswith(".json") and CONF_SHA256 not in config:
++        raise cv.Invalid("sha256 is required unless source is a manifest (.json)")
++    return config
++
++
++STORAGE_SCHEMA = cv.All(
++    BASE_SCHEMA.extend(
++        {
++            cv.Required(CONF_SOURCE): cv.string_strict,
++            cv.Optional(CONF_SHA256): _validate_sha256,
++        }
++    ),
++    _validate_storage_source,
++)
++
+ CONFIG_SCHEMA = cv.All(
+     cv.typed_schema(
+         {
+             TYPE_EMBEDDED: EMBEDDED_SCHEMA,
+             TYPE_HTTP: HTTP_SCHEMA,
++            TYPE_STORAGE: STORAGE_SCHEMA,
+         }
+     ),
+     esp32.only_on_variant(
+@@ -158,7 +230,29 @@ FINAL_VALIDATE_SCHEMA = _validate_firmware
+ async def to_code(config: dict[str, Any]) -> None:
+     var = await update.new_update(config)
+ 
+-    if config[CONF_TYPE] == TYPE_EMBEDDED:
++    if (serial := config.get(CONF_SERIAL)) is not None:
++        cg.add(
++            var.set_serial(
++                serial[CONF_UART_NUM],
++                serial[CONF_TX_PIN],
++                serial[CONF_RX_PIN],
++                serial[CONF_BOOT_PIN],
++                serial[CONF_BAUD_RATE],
++            )
++        )
++        cg.add(var.set_serial_default(serial[CONF_ENABLED]))
++        cg.add_define("USE_ESP32_HOSTED_SERIAL")
++    if CONF_SAFE_MODE_ID in config:
++        safe_mode = await cg.get_variable(config[CONF_SAFE_MODE_ID])
++        cg.add(var.set_safe_mode(safe_mode))
++        cg.add_define("USE_ESP32_HOSTED_UPDATE_SAFE_MODE")
++    for on_progress in config.get(CONF_ON_PROGRESS, []):
++        await automation.build_automation(
++            var.get_progress_trigger(), [(float, "x")], on_progress
++        )
++
++    firmware_type = config[CONF_TYPE]
++    if firmware_type == TYPE_EMBEDDED:
+         firmware_data = _firmware_path(config).read_bytes()
+         rhs = [HexInt(x) for x in firmware_data]
+         arr_id = ID(f"{config[CONF_ID]}_data", is_declaration=True, type=cg.uint8)
+@@ -168,9 +262,26 @@ async def to_code(config: dict[str, Any]) -> None:
+         cg.add(var.set_firmware_sha256([HexInt(b) for b in sha256_bytes]))
+         cg.add(var.set_firmware_data(prog_arr))
+         cg.add(var.set_firmware_size(len(firmware_data)))
++        cg.add(var.set_method(UpdateMethod.EMBEDDED))
++        cg.add_define("USE_ESP32_HOSTED_EMBEDDED_UPDATE")
++    elif firmware_type == TYPE_STORAGE:
++        # Read the firmware from a mounted storage at runtime. The path is resolved through the
++        # storage registry when the update is performed; the sha256 is verified while streaming.
++        from esphome.components.storage import request_storage_worker
++
++        if CONF_SHA256 in config:
++            sha256_bytes = bytes.fromhex(config[CONF_SHA256])
++            cg.add(var.set_firmware_sha256([HexInt(b) for b in sha256_bytes]))
++        cg.add(var.set_method(UpdateMethod.STORAGE))
++        cg.add(var.set_storage_path(config[CONF_SOURCE]))
++        cg.add_define("USE_ESP32_HOSTED_STORAGE_UPDATE")
++        request_storage_worker()
+     else:
+         await cg.add_variable(var.set_http_request_parent, config[CONF_HTTP_REQUEST_ID])
+         cg.add(var.set_source_url(config[CONF_SOURCE]))
++        cg.add(var.set_method(UpdateMethod.HTTP))
+         cg.add_define("USE_ESP32_HOSTED_HTTP_UPDATE")
++        if await network.register_active_interface_listener(var):
++            cg.add_define("USE_ESP32_HOSTED_UPDATE_NETWORK_EVENT")
+ 
+     await cg.register_component(var, config)
+diff --git a/esphome/components/esp32_hosted/update/c6_serial.cpp b/esphome/components/esp32_hosted/update/c6_serial.cpp
+new file mode 100644
+index 0000000000..8e9b1f94ee
+--- /dev/null
++++ b/esphome/components/esp32_hosted/update/c6_serial.cpp
+@@ -0,0 +1,389 @@
++#include "c6_serial.h"
++
++#ifdef USE_ESP32_HOSTED_SERIAL
++
++#include "esphome/components/md5/md5.h"
++#include "esphome/core/hal.h"
++#include "esphome/core/log.h"
++
++#include <driver/gpio.h>
++#include <driver/uart.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++
++#include <algorithm>
++#include <cinttypes>
++#include <cstring>
++
++extern "C" int eh_host_port_reset_slave(void);
++
++namespace esphome::esp32_hosted {
++
++ESPHOME_LOG_TAG(TAG, "esp32_hosted.serial");
++
++static constexpr uint8_t SLIP_END = 0xC0;
++static constexpr uint8_t SLIP_ESC = 0xDB;
++static constexpr uint8_t SLIP_ESC_END = 0xDC;
++static constexpr uint8_t SLIP_ESC_ESC = 0xDD;
++
++static constexpr uint8_t OP_FLASH_BEGIN = 0x02;
++static constexpr uint8_t OP_FLASH_DATA = 0x03;
++static constexpr uint8_t OP_SYNC = 0x08;
++static constexpr uint8_t OP_SPI_SET_PARAMS = 0x0B;
++static constexpr uint8_t OP_SPI_ATTACH = 0x0D;
++static constexpr uint8_t OP_CHANGE_BAUDRATE = 0x0F;
++static constexpr uint8_t OP_SPI_FLASH_MD5 = 0x13;
++
++static constexpr uint8_t IMAGE_MAGIC = 0xE9;
++static constexpr uint32_t IMAGE_CHIP_OFFSET = 12;
++static constexpr uint8_t IMAGE_CHIP_C6 = 0x0D;
++static constexpr uint32_t PARTITION_TABLE_OFFSET = 0x8000;
++static constexpr uint8_t PARTITION_MAGIC_0 = 0xAA;
++static constexpr uint8_t PARTITION_MAGIC_1 = 0x50;
++static constexpr uint32_t ROM_BAUD = 115200;
++static constexpr size_t UART_RX_BUFFER = 2048;
++static constexpr size_t SLIP_CHUNK = 128;
++static constexpr size_t FRAME_MAX = 64;
++static constexpr uint32_t FLASH_BLOCK = 0x400;
++static constexpr uint32_t CHECKSUM_START = 0xEF;
++static constexpr uint32_t FLASH_LIMIT = 16u * 1024u * 1024u;
++static constexpr uint32_t FLASH_ERASE_BLOCK = 64u * 1024u;
++static constexpr uint32_t FLASH_SECTOR = 4096;
++static constexpr uint32_t FLASH_PAGE = 256;
++static constexpr uint32_t FLASH_STATUS_MASK = 0xFFFF;
++static constexpr int SYNC_ATTEMPTS = 40;
++static constexpr int WRITE_ATTEMPTS = 3;
++static constexpr uint32_t SYNC_TIMEOUT_MS = 100;
++static constexpr uint32_t COMMAND_TIMEOUT_MS = 3000;
++static constexpr uint32_t ERASE_MS_PER_MB = 40000;
++static constexpr uint32_t MD5_MS_PER_MB = 8000;
++static constexpr uint32_t BAUD_SETTLE_MS = 50;
++static constexpr uint32_t SYNC_SETTLE_MS = 100;
++static constexpr uint32_t BOOT_SETTLE_MS = 100;
++static constexpr size_t MD5_HEX_LEN = 32;
++static constexpr size_t LOG_LINE = 128;
++static constexpr uint32_t LOG_READ_MS = 200;
++
++static uint32_t scaled_timeout(uint32_t ms_per_mb, uint32_t size) {
++  const uint64_t timeout = static_cast<uint64_t>(ms_per_mb) * size / 1000000u;
++  return std::max<uint32_t>(static_cast<uint32_t>(timeout), COMMAND_TIMEOUT_MS);
++}
++
++static void put_u32(uint8_t *out, uint32_t value) { std::memcpy(out, &value, sizeof(value)); }
++
++void C6Serial::set_config(uint8_t uart_num, int tx_pin, int rx_pin, int boot_pin, uint32_t baud_rate) {
++  this->uart_num_ = uart_num;
++  this->tx_pin_ = tx_pin;
++  this->rx_pin_ = rx_pin;
++  this->boot_pin_ = boot_pin;
++  this->baud_rate_ = baud_rate;
++}
++
++void C6Serial::set_pins(uint8_t uart_num, int tx_pin, int rx_pin, int boot_pin) {
++  this->uart_num_ = uart_num;
++  this->tx_pin_ = tx_pin;
++  this->rx_pin_ = rx_pin;
++  this->boot_pin_ = boot_pin;
++}
++
++bool C6Serial::image_ok(const uint8_t *image, uint32_t size) {
++  if (size <= PARTITION_TABLE_OFFSET + 1 || size > FLASH_LIMIT || image[0] != IMAGE_MAGIC ||
++      image[IMAGE_CHIP_OFFSET] != IMAGE_CHIP_C6 || image[IMAGE_CHIP_OFFSET + 1] != 0 ||
++      image[PARTITION_TABLE_OFFSET] != PARTITION_MAGIC_0 || image[PARTITION_TABLE_OFFSET + 1] != PARTITION_MAGIC_1) {
++    ESP_LOGE(TAG, "No C6 factory image (%" PRIu32 " bytes): nothing stopped, nothing written", size);
++    return false;
++  }
++  return true;
++}
++
++bool C6Serial::open() {
++  const auto port = static_cast<uart_port_t>(this->uart_num_);
++  uart_config_t config{};
++  config.baud_rate = ROM_BAUD;
++  config.data_bits = UART_DATA_8_BITS;
++  config.parity = UART_PARITY_DISABLE;
++  config.stop_bits = UART_STOP_BITS_1;
++  config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
++  config.source_clk = UART_SCLK_DEFAULT;
++  esp_err_t err = uart_driver_install(port, UART_RX_BUFFER, 0, 0, nullptr, 0);
++  if (err == ESP_OK)
++    err = uart_param_config(port, &config);
++  if (err == ESP_OK)
++    err = uart_set_pin(port, this->tx_pin_, this->rx_pin_, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
++  if (err != ESP_OK) {
++    ESP_LOGE(TAG, "UART %u not opened: %s", this->uart_num_, esp_err_to_name(err));
++    uart_driver_delete(port);
++    return false;
++  }
++  this->open_uart_ = this->uart_num_;
++  this->open_tx_ = this->tx_pin_;
++  this->open_rx_ = this->rx_pin_;
++  return true;
++}
++
++void C6Serial::close() {
++  uart_driver_delete(static_cast<uart_port_t>(this->open_uart_));
++  gpio_reset_pin(static_cast<gpio_num_t>(this->open_tx_));
++  gpio_reset_pin(static_cast<gpio_num_t>(this->open_rx_));
++}
++
++void C6Serial::enter_bootloader() {
++  const auto pin = static_cast<gpio_num_t>(this->boot_pin_);
++  gpio_set_level(pin, 0);
++  gpio_set_direction(pin, GPIO_MODE_OUTPUT_OD);
++  gpio_set_level(pin, 0);
++  eh_host_port_reset_slave();
++  vTaskDelay(pdMS_TO_TICKS(BOOT_SETTLE_MS));
++}
++
++void C6Serial::leave_bootloader() {
++  gpio_reset_pin(static_cast<gpio_num_t>(this->boot_pin_));
++  eh_host_port_reset_slave();
++}
++
++void C6Serial::send_(uint8_t op, const uint8_t *head, size_t head_len, const uint8_t *data, size_t data_len,
++                     uint32_t checksum) {
++  const auto port = static_cast<uart_port_t>(this->uart_num_);
++  const size_t total = head_len + data_len;
++  const uint8_t header[8] = {0,
++                             op,
++                             static_cast<uint8_t>(total & 0xFF),
++                             static_cast<uint8_t>(total >> 8),
++                             static_cast<uint8_t>(checksum & 0xFF),
++                             static_cast<uint8_t>((checksum >> 8) & 0xFF),
++                             static_cast<uint8_t>((checksum >> 16) & 0xFF),
++                             static_cast<uint8_t>(checksum >> 24)};
++  uint8_t out[SLIP_CHUNK];
++  size_t used = 0;
++  auto put = [&](const uint8_t *bytes, size_t len) {
++    for (size_t i = 0; i < len; i++) {
++      if (used + 2 > sizeof(out)) {
++        uart_write_bytes(port, out, used);
++        used = 0;
++      }
++      if (bytes[i] == SLIP_END) {
++        out[used++] = SLIP_ESC;
++        out[used++] = SLIP_ESC_END;
++      } else if (bytes[i] == SLIP_ESC) {
++        out[used++] = SLIP_ESC;
++        out[used++] = SLIP_ESC_ESC;
++      } else {
++        out[used++] = bytes[i];
++      }
++    }
++  };
++  out[used++] = SLIP_END;
++  put(header, sizeof(header));
++  put(head, head_len);
++  put(data, data_len);
++  if (used + 1 > sizeof(out)) {
++    uart_write_bytes(port, out, used);
++    used = 0;
++  }
++  out[used++] = SLIP_END;
++  uart_write_bytes(port, out, used);
++}
++
++bool C6Serial::receive_(uint8_t op, uint32_t timeout_ms, uint8_t *out, size_t out_max, size_t *out_len) {
++  const auto port = static_cast<uart_port_t>(this->uart_num_);
++  const uint32_t start = millis();
++  uint8_t frame[FRAME_MAX];
++  size_t len = 0;
++  bool in_frame = false;
++  bool escaped = false;
++  for (;;) {
++    const uint32_t spent = millis() - start;
++    if (spent >= timeout_ms)
++      return false;
++    uint8_t byte;
++    if (uart_read_bytes(port, &byte, 1, pdMS_TO_TICKS(timeout_ms - spent)) <= 0)
++      return false;
++    if (!in_frame) {
++      if (byte == SLIP_END) {
++        in_frame = true;
++        len = 0;
++        escaped = false;
++      }
++      continue;
++    }
++    if (byte == SLIP_END) {
++      if (len >= 8 && frame[0] == 1 && frame[1] == op) {
++        const size_t data_len = std::min<size_t>(len - 8, out_max);
++        if (out != nullptr && data_len > 0)
++          std::memcpy(out, frame + 8, data_len);
++        if (out_len != nullptr)
++          *out_len = data_len;
++        return true;
++      }
++      len = 0;
++      escaped = false;
++      continue;
++    }
++    if (escaped) {
++      byte = byte == SLIP_ESC_END ? SLIP_END : SLIP_ESC;
++      escaped = false;
++    } else if (byte == SLIP_ESC) {
++      escaped = true;
++      continue;
++    }
++    if (len < sizeof(frame))
++      frame[len++] = byte;
++  }
++}
++
++bool C6Serial::command_(uint8_t op, const uint8_t *head, size_t head_len, const uint8_t *data, size_t data_len,
++                        uint32_t checksum, uint8_t *answer, size_t answer_len, uint32_t timeout_ms) {
++  this->send_(op, head, head_len, data, data_len, checksum);
++  uint8_t reply[FRAME_MAX];
++  size_t reply_len = 0;
++  if (!this->receive_(op, timeout_ms, reply, sizeof(reply), &reply_len)) {
++    ESP_LOGW(TAG, "No answer to command 0x%02X", op);
++    return false;
++  }
++  if (reply_len < answer_len + 2 || reply[answer_len] != 0) {
++    ESP_LOGW(TAG, "Command 0x%02X refused (%u bytes, status 0x%02X, reason 0x%02X)", op,
++             static_cast<unsigned>(reply_len), reply_len > answer_len ? reply[answer_len] : 0,
++             reply_len > answer_len + 1 ? reply[answer_len + 1] : 0);
++    return false;
++  }
++  if (answer != nullptr && answer_len > 0)
++    std::memcpy(answer, reply, answer_len);
++  return true;
++}
++
++bool C6Serial::sync_() {
++  static const uint8_t HEAD[4] = {0x07, 0x07, 0x12, 0x20};
++  uint8_t body[32];
++  std::memset(body, 0x55, sizeof(body));
++  const auto port = static_cast<uart_port_t>(this->uart_num_);
++  for (int attempt = 0; attempt < SYNC_ATTEMPTS; attempt++) {
++    uart_flush_input(port);
++    this->send_(OP_SYNC, HEAD, sizeof(HEAD), body, sizeof(body), 0);
++    if (this->receive_(OP_SYNC, SYNC_TIMEOUT_MS, nullptr, 0, nullptr)) {
++      vTaskDelay(pdMS_TO_TICKS(SYNC_SETTLE_MS));
++      uart_flush_input(port);
++      return true;
++    }
++  }
++  return false;
++}
++
++bool C6Serial::write_block_(const uint8_t *block, uint32_t seq) {
++  uint8_t head[16];
++  put_u32(head, FLASH_BLOCK);
++  put_u32(head + 4, seq);
++  put_u32(head + 8, 0);
++  put_u32(head + 12, 0);
++  uint32_t checksum = CHECKSUM_START;
++  for (uint32_t i = 0; i < FLASH_BLOCK; i++)
++    checksum ^= block[i];
++  for (int attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
++    if (this->command_(OP_FLASH_DATA, head, sizeof(head), block, FLASH_BLOCK, checksum, nullptr, 0, COMMAND_TIMEOUT_MS))
++      return true;
++  }
++  return false;
++}
++
++bool C6Serial::flash(const uint8_t *image, uint32_t size, SerialProgress progress, void *ctx) {
++  const auto port = static_cast<uart_port_t>(this->uart_num_);
++  if (!this->sync_()) {
++    ESP_LOGE(TAG, "The C6 bootloader does not answer");
++    return false;
++  }
++  uint8_t params[24]{};
++  if (!this->command_(OP_SPI_ATTACH, params, 8, nullptr, 0, 0, nullptr, 0, COMMAND_TIMEOUT_MS))
++    return false;
++  put_u32(params, 0);
++  put_u32(params + 4, FLASH_LIMIT);
++  put_u32(params + 8, FLASH_ERASE_BLOCK);
++  put_u32(params + 12, FLASH_SECTOR);
++  put_u32(params + 16, FLASH_PAGE);
++  put_u32(params + 20, FLASH_STATUS_MASK);
++  if (!this->command_(OP_SPI_SET_PARAMS, params, 24, nullptr, 0, 0, nullptr, 0, COMMAND_TIMEOUT_MS))
++    return false;
++  put_u32(params, this->baud_rate_);
++  put_u32(params + 4, 0);
++  this->send_(OP_CHANGE_BAUDRATE, params, 8, nullptr, 0, 0);
++  if (!this->receive_(OP_CHANGE_BAUDRATE, COMMAND_TIMEOUT_MS, nullptr, 0, nullptr))
++    return false;
++  uart_set_baudrate(port, this->baud_rate_);
++  vTaskDelay(pdMS_TO_TICKS(BAUD_SETTLE_MS));
++  uart_flush_input(port);
++
++  const uint32_t blocks = (size + FLASH_BLOCK - 1) / FLASH_BLOCK;
++  put_u32(params, size);
++  put_u32(params + 4, blocks);
++  put_u32(params + 8, FLASH_BLOCK);
++  put_u32(params + 12, 0);
++  put_u32(params + 16, 0);
++  ESP_LOGI(TAG, "Erasing %" PRIu32 " bytes", size);
++  if (!this->command_(OP_FLASH_BEGIN, params, 20, nullptr, 0, 0, nullptr, 0, scaled_timeout(ERASE_MS_PER_MB, size)))
++    return false;
++
++  uint8_t last[FLASH_BLOCK];
++  uint32_t reported = 0;
++  for (uint32_t seq = 0; seq < blocks; seq++) {
++    const uint32_t at = seq * FLASH_BLOCK;
++    const uint32_t left = size - at;
++    const uint8_t *block = image + at;
++    if (left < FLASH_BLOCK) {
++      std::memcpy(last, block, left);
++      std::memset(last + left, 0xFF, FLASH_BLOCK - left);
++      block = last;
++    }
++    if (!this->write_block_(block, seq)) {
++      ESP_LOGE(TAG, "Writing failed at %" PRIu32, at);
++      return false;
++    }
++    const uint32_t percent = (seq + 1) * 100 / blocks;
++    if (percent >= reported + 5) {
++      reported = percent;
++      progress(ctx, static_cast<uint8_t>(percent));
++    }
++  }
++
++  put_u32(params, 0);
++  put_u32(params + 4, size);
++  put_u32(params + 8, 0);
++  put_u32(params + 12, 0);
++  char answer[MD5_HEX_LEN + 1]{};
++  if (!this->command_(OP_SPI_FLASH_MD5, params, 16, nullptr, 0, 0, reinterpret_cast<uint8_t *>(answer), MD5_HEX_LEN,
++                      scaled_timeout(MD5_MS_PER_MB, size)))
++    return false;
++  md5::MD5Digest digest;
++  digest.init();
++  digest.add(image, size);
++  digest.calculate();
++  if (!digest.equals_hex(answer)) {
++    ESP_LOGE(TAG, "MD5 of the written image differs");
++    return false;
++  }
++  ESP_LOGI(TAG, "%" PRIu32 " bytes written and verified", size);
++  return true;
++}
++
++void C6Serial::read_log(const std::atomic<bool> &stop) {
++  const auto port = static_cast<uart_port_t>(this->uart_num_);
++  char line[LOG_LINE];
++  size_t len = 0;
++  uint8_t chunk[64];
++  while (!stop.load(std::memory_order_acquire)) {
++    const int got = uart_read_bytes(port, chunk, sizeof(chunk), pdMS_TO_TICKS(LOG_READ_MS));
++    for (int i = 0; i < got; i++) {
++      const char c = static_cast<char>(chunk[i]);
++      if (c == '\n' || c == '\r' || len == sizeof(line) - 1) {
++        if (len > 0) {
++          line[len] = '\0';
++          ESP_LOGI(TAG, "C6 uart: %s", line);
++          len = 0;
++        }
++      }
++      if (c >= ' ' && c <= '~')
++        line[len++] = c;
++    }
++  }
++}
++
++}
++
++#endif
+diff --git a/esphome/components/esp32_hosted/update/c6_serial.h b/esphome/components/esp32_hosted/update/c6_serial.h
+new file mode 100644
+index 0000000000..11f31ac39f
+--- /dev/null
++++ b/esphome/components/esp32_hosted/update/c6_serial.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include "esphome/core/defines.h"
++
++#ifdef USE_ESP32_HOSTED_SERIAL
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++
++namespace esphome::esp32_hosted {
++
++using SerialProgress = void (*)(void *ctx, uint8_t percent);
++
++class C6Serial {
++ public:
++  void set_config(uint8_t uart_num, int tx_pin, int rx_pin, int boot_pin, uint32_t baud_rate);
++  void set_pins(uint8_t uart_num, int tx_pin, int rx_pin, int boot_pin);
++  static bool image_ok(const uint8_t *image, uint32_t size);
++  bool open();
++  void close();
++  void enter_bootloader();
++  void leave_bootloader();
++  bool flash(const uint8_t *image, uint32_t size, SerialProgress progress, void *ctx);
++  void read_log(const std::atomic<bool> &stop);
++
++ protected:
++  void send_(uint8_t op, const uint8_t *head, size_t head_len, const uint8_t *data, size_t data_len, uint32_t checksum);
++  bool receive_(uint8_t op, uint32_t timeout_ms, uint8_t *out, size_t out_max, size_t *out_len);
++  bool command_(uint8_t op, const uint8_t *head, size_t head_len, const uint8_t *data, size_t data_len,
++                uint32_t checksum, uint8_t *answer, size_t answer_len, uint32_t timeout_ms);
++  bool sync_();
++  bool write_block_(const uint8_t *block, uint32_t seq);
++
++  uint8_t uart_num_{0};
++  int tx_pin_{-1};
++  int rx_pin_{-1};
++  int boot_pin_{-1};
++  uint32_t baud_rate_{460800};
++  uint8_t open_uart_{0};
++  int open_tx_{-1};
++  int open_rx_{-1};
++};
++
++}
++
++#endif
+diff --git a/esphome/components/esp32_hosted/update/esp32_hosted_update.cpp b/esphome/components/esp32_hosted/update/esp32_hosted_update.cpp
+index 33b88775bb..d37d0f8b03 100644
+--- a/esphome/components/esp32_hosted/update/esp32_hosted_update.cpp
++++ b/esphome/components/esp32_hosted/update/esp32_hosted_update.cpp
+@@ -1,22 +1,46 @@
+ #if defined(USE_ESP32_VARIANT_ESP32H2) || defined(USE_ESP32_VARIANT_ESP32P4)
+ #include "esp32_hosted_update.h"
++#include "esphome/components/esp32/system_info.h"
+ #include "esphome/components/watchdog/watchdog.h"
+-#include "esphome/components/sha256/sha256.h"
+ #include "esphome/core/application.h"
++#include "esphome/core/helpers.h"
+ #include "esphome/core/log.h"
+ #include <esp_image_format.h>
+ #include <esp_app_desc.h>
+ #include <esp_hosted.h>
+ #include <esp_hosted_host_fw_ver.h>
+ #include <esp_ota_ops.h>
++#include <algorithm>
++#include <cstring>
++#include <strings.h>
+ #include <esp_system.h>
+ #include <esp_wifi.h>
+ 
+ #ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-#include "esphome/components/http_request/http_request.h"
+-#include "esphome/components/json/json_util.h"
+ #include "esphome/components/network/util.h"
+ #endif
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++#include "esphome/components/json/json_util.h"
++#endif
++
++#include <esp_system.h>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++
++#ifdef USE_WIFI
++#include "esphome/components/wifi/wifi_component.h"
++#include <esp_netif.h>
++#include <esp_wifi.h>
++#endif
++#ifdef USE_ETHERNET
++#include "esphome/components/ethernet/ethernet_component.h"
++#endif
++#ifdef USE_USB_ETHERNET
++#include "esphome/components/usb_ethernet/usb_ethernet.h"
++#endif
++#ifdef USE_USB_BLUETOOTH_C6_OFFLOAD
++#include "esphome/components/usb_bluetooth/c6_offload.h"
++#endif
+ 
+ extern "C" {
+ #include <esp_hosted_ota.h>
+@@ -27,9 +51,36 @@ namespace esphome::esp32_hosted {
+ ESPHOME_LOG_TAG(TAG, "esp32_hosted.update");
+ 
+ // The host rejects writes above its per-RPC payload limit before they reach the coprocessor
+-constexpr size_t CHUNK_SIZE = EH_HOST_CP_OTA_CHUNK_MAX;
++constexpr size_t STOCK_SDIO_PACKET = 1536;
++constexpr size_t CHUNK_SIZE = EH_HOST_CP_OTA_CHUNK_MAX - (ESP_TRANSPORT_SDIO_MAX_BUF_SIZE - STOCK_SDIO_PACKET);
+ // OTA begin blocks while the coprocessor erases its partition, end while it validates the image
+ constexpr uint32_t OTA_WDT_TIMEOUT_MS = 60000;
++constexpr uint32_t PROGRESS_MS = 500;
++constexpr uint32_t SLOT_MSG_COMMAND = 0x42545070;
++constexpr uint32_t SLOT_MSG_STATE = 0x42545071;
++constexpr uint8_t SLOT_QUERY = 0;
++constexpr uint8_t SLOT_BOOT_OTHER = 1;
++constexpr uint8_t SLOT_BOOT_MAIN = 2;
++constexpr uint8_t SLOT_BOOT_MINIMAL = 3;
++constexpr uint8_t SLOT_CLONE = 4;
++constexpr uint8_t SLOT_TABLE = 5;
++constexpr uint8_t SLOT_TABLE_OURS = 1;
++constexpr uint8_t SLOT_TABLE_STOCK = 2;
++constexpr uint64_t STOCK_APP_SIZE = 0x1C0000;
++constexpr uint32_t SLOT_CLONE_MS = 120000;
++constexpr uint32_t SLOT_TABLE_MS = 30000;
++constexpr size_t SLOT_STATE_MIN = 6;
++constexpr uint32_t SLOT_ANSWER_MS = 3000;
++constexpr uint32_t SLOT_TIMEOUT_ID = 1;
++constexpr uint32_t UPDATE_TASK_STACK = 6144;
++constexpr UBaseType_t UPDATE_TASK_PRIORITY = 5;
++constexpr uint32_t UPDATE_FREE_RETRY_MS = 10;
++constexpr uint32_t UPDATE_NOTICE_MS = 3000;
++constexpr uint8_t SLOT_PROGRESS_STEP = 5;
++#ifdef USE_ESP32_HOSTED_SERIAL
++constexpr uint32_t SERIAL_LOG_STACK = 4096;
++constexpr UBaseType_t SERIAL_LOG_PRIORITY = 2;
++#endif
+ 
+ static esp_err_t ota_end_guarded() {
+   watchdog::WatchdogManager wdt(OTA_WDT_TIMEOUT_MS);
+@@ -47,7 +98,7 @@ constexpr uint32_t INITIAL_CHECK_INTERVAL_ID = 0;
+ static const char *const ESP_HOSTED_VERSION_STR = STRINGIFY(ESP_HOSTED_VERSION_MAJOR_1) "." STRINGIFY(
+     ESP_HOSTED_VERSION_MINOR_1) "." STRINGIFY(ESP_HOSTED_VERSION_PATCH_1);
+ 
+-#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
+ // Parse an integer from str, advancing ptr past the number
+ // Returns false if no digits were parsed
+ static bool parse_int(const char *&ptr, int &value) {
+@@ -91,6 +142,23 @@ static int compare_versions(int major1, int minor1, int patch1, int major2, int
+ }
+ #endif
+ 
++void Esp32HostedUpdate::read_version_() {
++  esp_hosted_coprocessor_fwver_t ver_info;
++  if (esp_hosted_get_coprocessor_fwversion(&ver_info) == ESP_OK) {
++    char buf[52];
++    if (ver_info.build > 0) {
++      snprintf(buf, sizeof(buf), "%" PRIu32 ".%" PRIu32 ".%" PRIu32 "+xbt.%" PRId32, ver_info.major1, ver_info.minor1,
++               ver_info.patch1, ver_info.build);
++    } else {
++      snprintf(buf, sizeof(buf), "%" PRIu32 ".%" PRIu32 ".%" PRIu32, ver_info.major1, ver_info.minor1, ver_info.patch1);
++    }
++    this->update_info_.current_version = buf;
++  } else {
++    this->update_info_.current_version = "unknown";
++  }
++  ESP_LOGD(TAG, "Coprocessor version: %s", this->update_info_.current_version.c_str());
++}
++
+ void Esp32HostedUpdate::setup() {
+   this->update_info_.title = "ESP32 Hosted Coprocessor";
+ 
+@@ -99,73 +167,121 @@ void Esp32HostedUpdate::setup() {
+   esp_hosted_connect_to_slave();  // NOLINT
+ #endif
+ 
+-  // Get coprocessor version
+-  esp_hosted_coprocessor_fwver_t ver_info;
+-  if (esp_hosted_get_coprocessor_fwversion(&ver_info) == ESP_OK) {
+-    // 16 bytes: "255.255.255" (11 chars) + null + safety margin
+-    char buf[16];
+-    snprintf(buf, sizeof(buf), "%" PRIu32 ".%" PRIu32 ".%" PRIu32, ver_info.major1, ver_info.minor1, ver_info.patch1);
+-    this->update_info_.current_version = buf;
+-  } else {
+-    this->update_info_.current_version = "unknown";
++  this->read_version_();
++#ifdef USE_ESP32_HOSTED_SERIAL
++  this->serial_settings_load_();
++#endif
++  this->slot_query_(false);
++#if defined(USE_ESP32_HOSTED_UPDATE_SAFE_MODE) && defined(USE_SAFE_MODE_SPLIT)
++  if (this->safe_mode_ != nullptr) {
++    this->safe_mode_->add_on_safe_ready_callback([this]() {
++      if (!this->await_safe_)
++        return;
++      this->await_safe_ = false;
++      this->defer([this]() { this->safe_install_(); });
++    });
+   }
+-  ESP_LOGD(TAG, "Coprocessor version: %s", this->update_info_.current_version.c_str());
++#endif
+ 
+-#ifndef USE_ESP32_HOSTED_HTTP_UPDATE
+-  // Embedded mode: get image version from embedded firmware
+-  const int app_desc_offset = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
+-  if (this->firmware_size_ >= app_desc_offset + sizeof(esp_app_desc_t)) {
+-    esp_app_desc_t *app_desc = (esp_app_desc_t *) (this->firmware_data_ + app_desc_offset);
+-    if (app_desc->magic_word == ESP_APP_DESC_MAGIC_WORD) {
+-      ESP_LOGD(TAG,
+-               "ESP32 Hosted firmware:\n"
+-               "  Firmware version: %s\n"
+-               "  Project name: %s\n"
+-               "  Build date: %s\n"
+-               "  Build time: %s\n"
+-               "  IDF version: %s",
+-               app_desc->version, app_desc->project_name, app_desc->date, app_desc->time, app_desc->idf_ver);
+-      this->update_info_.latest_version = app_desc->version;
+-      if (this->update_info_.latest_version != this->update_info_.current_version) {
+-        this->state_ = update::UPDATE_STATE_AVAILABLE;
++#ifdef USE_ESP32_HOSTED_EMBEDDED_UPDATE
++  if (this->method_ == UpdateMethod::EMBEDDED) {
++    // Embedded mode: get image version from embedded firmware
++    const int app_desc_offset = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
++    if (this->firmware_size_ >= app_desc_offset + sizeof(esp_app_desc_t)) {
++      esp_app_desc_t *app_desc = (esp_app_desc_t *) (this->firmware_data_ + app_desc_offset);
++      if (app_desc->magic_word == ESP_APP_DESC_MAGIC_WORD) {
++        ESP_LOGD(TAG,
++                 "ESP32 Hosted firmware:\n"
++                 "  Firmware version: %s\n"
++                 "  Project name: %s\n"
++                 "  Build date: %s\n"
++                 "  Build time: %s\n"
++                 "  IDF version: %s",
++                 app_desc->version, app_desc->project_name, app_desc->date, app_desc->time, app_desc->idf_ver);
++        this->update_info_.latest_version = app_desc->version;
++        if (this->update_info_.latest_version != this->update_info_.current_version) {
++          this->state_ = update::UPDATE_STATE_AVAILABLE;
++        } else {
++          this->state_ = update::UPDATE_STATE_NO_UPDATE;
++        }
+       } else {
++        ESP_LOGW(TAG, "Invalid app description magic word: 0x%08" PRIx32 " (expected 0x%08" PRIx32 ")",
++                 app_desc->magic_word, static_cast<uint32_t>(ESP_APP_DESC_MAGIC_WORD));
+         this->state_ = update::UPDATE_STATE_NO_UPDATE;
+       }
+     } else {
+-      ESP_LOGW(TAG, "Invalid app description magic word: 0x%08" PRIx32 " (expected 0x%08" PRIx32 ")",
+-               app_desc->magic_word, static_cast<uint32_t>(ESP_APP_DESC_MAGIC_WORD));
++      ESP_LOGW(TAG, "Firmware too small to contain app description");
+       this->state_ = update::UPDATE_STATE_NO_UPDATE;
+     }
+-  } else {
+-    ESP_LOGW(TAG, "Firmware too small to contain app description");
+-    this->state_ = update::UPDATE_STATE_NO_UPDATE;
+-  }
+ 
+-  // Publish state
+-  this->status_clear_error();
+-  this->publish_state();
+-  // Defer so the automation runs on the main loop after setup, not during App.setup()
+-  if (this->state_ == update::UPDATE_STATE_AVAILABLE && this->update_available_trigger_) {
+-    this->defer([this]() { this->update_available_trigger_->trigger(this->update_info_); });
+-  }
+-#else
+-  // HTTP mode: check every 10s until network is ready (max 6 attempts)
+-  // Only if update interval is > 1 minute to avoid redundant checks
+-  if (this->get_update_interval() > 60000) {
+-    this->initial_check_remaining_ = 6;
+-    this->set_interval(INITIAL_CHECK_INTERVAL_ID, 10000, [this]() {
+-      bool connected = network::is_connected();
+-      if (--this->initial_check_remaining_ == 0 || connected) {
+-        this->cancel_interval(INITIAL_CHECK_INTERVAL_ID);
+-        if (connected) {
+-          this->check();
++    // Publish state
++    this->status_clear_error();
++    this->publish_state();
++    return;
++  }
++#endif
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  if (this->method_ == UpdateMethod::STORAGE) {
++    if (this->is_manifest_()) {
++      this->state_ = update::UPDATE_STATE_NO_UPDATE;
++      this->publish_state();
++      return;
++    }
++    // Storage mode: no availability/version discovery — the firmware to install is whatever the
++    // user placed on the configured storage path. Offer it as available; the install reads and
++    // verifies (sha256) at perform() time.
++    this->update_info_.latest_version = "storage";
++    this->state_ = update::UPDATE_STATE_AVAILABLE;
++    this->status_clear_error();
++    this->publish_state();
++    // Defer so the automation runs on the main loop after setup, not during App.setup()
++    if (this->update_available_trigger_) {
++      this->defer([this]() { this->update_available_trigger_->trigger(this->update_info_); });
++    }
++    return;
++  }
++#endif
++#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
++  if (this->method_ == UpdateMethod::HTTP) {
++    // HTTP mode: check every 10s until network is ready (max 6 attempts)
++    // Only if update interval is > 1 minute to avoid redundant checks
++#ifdef USE_ESP32_HOSTED_UPDATE_NETWORK_EVENT
++    this->initial_check_pending_ = true;
++    return;
++#endif
++    if (this->get_update_interval() > 60000) {
++      this->initial_check_remaining_ = 6;
++      this->set_interval(INITIAL_CHECK_INTERVAL_ID, 10000, [this]() {
++        bool connected = network::is_connected();
++        if (--this->initial_check_remaining_ == 0 || connected) {
++          this->cancel_interval(INITIAL_CHECK_INTERVAL_ID);
++          if (connected) {
++            this->check();
++          }
+         }
+-      }
+-    });
++      });
++    }
+   }
+ #endif
+ }
+ 
++void Esp32HostedUpdate::update() {
++#ifdef USE_ESP32_HOSTED_UPDATE_NETWORK_EVENT
++  if (this->initial_check_pending_)
++    return;
++#endif
++  this->check();
++}
++
++#ifdef USE_ESP32_HOSTED_UPDATE_NETWORK_EVENT
++void Esp32HostedUpdate::on_active_interface(network::NetworkInterface interface) {
++  if (!this->initial_check_pending_ || interface == network::NetworkInterface::NETWORK_INTERFACE_NONE)
++    return;
++  this->initial_check_pending_ = false;
++  this->defer([this]() { this->check(); });
++}
++#endif
++
+ void Esp32HostedUpdate::dump_config() {
+   ESP_LOGCONFIG(TAG,
+                 "ESP32 Hosted Update:\n"
+@@ -175,29 +291,57 @@ void Esp32HostedUpdate::dump_config() {
+                 ESP_HOSTED_VERSION_STR, this->update_info_.current_version.c_str(),
+                 this->update_info_.latest_version.c_str());
+ #ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-  ESP_LOGCONFIG(TAG,
+-                "  Mode: HTTP\n"
+-                "  Source URL: %s",
+-                this->source_url_);
+-#else
+-  ESP_LOGCONFIG(TAG,
+-                "  Mode: Embedded\n"
+-                "  Firmware Size: %zu bytes",
+-                this->firmware_size_);
++  if (this->method_ == UpdateMethod::HTTP)
++    ESP_LOGCONFIG(TAG,
++                  "  Mode: HTTP\n"
++                  "  Source URL: %s",
++                  this->source_url_);
++#endif
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  if (this->method_ == UpdateMethod::STORAGE)
++    ESP_LOGCONFIG(TAG,
++                  "  Mode: Storage\n"
++                  "  Path: %s",
++                  this->storage_path_.c_str());
++#endif
++#ifdef USE_ESP32_HOSTED_EMBEDDED_UPDATE
++  if (this->method_ == UpdateMethod::EMBEDDED)
++    ESP_LOGCONFIG(TAG,
++                  "  Mode: Embedded\n"
++                  "  Firmware Size: %zu bytes",
++                  this->firmware_size_);
+ #endif
+ }
+ 
+ void Esp32HostedUpdate::check() {
+-#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-  if (!network::is_connected()) {
+-    ESP_LOGD(TAG, "Network not connected, skipping update check");
++  if (this->busy_)
+     return;
+-  }
+-
+-  if (!this->fetch_manifest_()) {
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  if (this->method_ == UpdateMethod::STORAGE) {
++    if (this->is_manifest_())
++      this->storage_check_();
+     return;
+   }
++#endif
++#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
++  if (this->method_ == UpdateMethod::HTTP) {
++    if (this->source_url_ == nullptr || this->source_url_[0] == '\0' ||
++        std::strstr(this->source_url_, "//0.0.0.0") != nullptr)
++      return;
++    if (!network::is_connected()) {
++      ESP_LOGD(TAG, "Network not connected, skipping update check");
++      return;
++    }
++    if (this->checking_)
++      return;
++    this->checking_ = true;
++    this->fetch_manifest_();
++  }
++#endif
++}
+ 
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++void Esp32HostedUpdate::finish_check_() {
+   const bool was_available = this->state_ == update::UPDATE_STATE_AVAILABLE;
+ 
+   // Compare versions
+@@ -215,48 +359,13 @@ void Esp32HostedUpdate::check() {
+   if (this->state_ == update::UPDATE_STATE_AVAILABLE && !was_available && this->update_available_trigger_) {
+     this->update_available_trigger_->trigger(this->update_info_);
+   }
+-#endif
+ }
+ 
+-#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-bool Esp32HostedUpdate::fetch_manifest_() {
+-  ESP_LOGD(TAG, "Fetching manifest");
+-
+-  auto container = this->http_request_parent_->get(this->source_url_);
+-  if (container == nullptr || container->status_code != 200) {
+-    ESP_LOGE(TAG, "Failed to fetch manifest from %s", this->source_url_);
+-    this->status_set_error(LOG_STR("Failed to fetch manifest"));
+-    return false;
+-  }
+-
+-  // Read manifest JSON into string (manifest is small, ~1KB max)
+-  // NOTE: HttpContainer::read() has non-BSD socket semantics - see http_request.h
+-  // Use http_read_loop_result() helper instead of checking return values directly
+-  std::string json_str;
+-  json_str.reserve(container->content_length);
+-  uint8_t buf[256];
+-  uint32_t last_data_time = millis();
+-  const uint32_t read_timeout = this->http_request_parent_->get_timeout();
+-  while (container->get_bytes_read() < container->content_length) {
+-    int read_or_error = container->read(buf, sizeof(buf));
+-    App.feed_wdt();
+-    yield();
+-    auto result =
+-        http_request::http_read_loop_result(read_or_error, last_data_time, read_timeout, container->is_read_complete());
+-    if (result == http_request::HttpReadLoopResult::RETRY)
+-      continue;
+-    // Note: COMPLETE is currently unreachable since the loop condition checks bytes_read < content_length,
+-    // but this is defensive code in case chunked transfer encoding support is added in the future.
+-    if (result != http_request::HttpReadLoopResult::DATA)
+-      break;  // COMPLETE, ERROR, or TIMEOUT
+-    json_str.append(reinterpret_cast<char *>(buf), read_or_error);
+-  }
+-  container->end();
+-
++bool Esp32HostedUpdate::parse_manifest_(const std::string &json_str) {
+   // Parse JSON manifest
+   // Format: {"versions": [{"version": "2.7.0", "url": "...", "sha256": "..."}]}
+   // Only consider versions <= host library version to avoid compatibility issues
+-  bool valid = json::parse_json(json_str, [this](JsonObject root) -> bool {
++  return json::parse_json(json_str, [this](JsonObject root) -> bool {
+     if (!root["versions"].is<JsonArray>()) {
+       ESP_LOGE(TAG, "Manifest does not contain 'versions' array");
+       return false;
+@@ -271,7 +380,9 @@ bool Esp32HostedUpdate::fetch_manifest_() {
+     // Find the highest version that is compatible with the host library
+     // (version <= host version to avoid upgrading coprocessor ahead of host)
+     int best_major = -1, best_minor = -1, best_patch = -1;
+-    std::string best_version, best_url, best_sha256;
++    std::string best_version, best_url, best_sha256, best_factory_url, best_factory_sha256;
++    std::string best_minimal_url, best_minimal_sha256;
++    uint8_t best_minimal_revision = 0;
+ 
+     for (JsonObject entry : versions) {
+       if (!entry["version"].is<const char *>() || !entry["url"].is<const char *>() ||
+@@ -300,6 +411,15 @@ bool Esp32HostedUpdate::fetch_manifest_() {
+         best_version = ver_str;
+         best_url = entry["url"].as<std::string>();
+         best_sha256 = entry["sha256"].as<std::string>();
++        const bool factory = entry["factory_url"].is<const char *>() && entry["factory_sha256"].is<const char *>();
++        best_factory_url = factory ? entry["factory_url"].as<std::string>() : std::string();
++        best_factory_sha256 = factory ? entry["factory_sha256"].as<std::string>() : std::string();
++        const bool minimal = entry["minimal_url"].is<const char *>() && entry["minimal_sha256"].is<const char *>();
++        best_minimal_url = minimal ? entry["minimal_url"].as<std::string>() : std::string();
++        best_minimal_sha256 = minimal ? entry["minimal_sha256"].as<std::string>() : std::string();
++        best_minimal_revision = 0;
++        if (minimal && entry["minimal_revision"].is<int>())
++          best_minimal_revision = entry["minimal_revision"].as<uint8_t>();
+       }
+     }
+ 
+@@ -316,194 +436,1195 @@ bool Esp32HostedUpdate::fetch_manifest_() {
+       ESP_LOGE(TAG, "Invalid SHA256: %s", best_sha256.c_str());
+       return false;
+     }
++    this->factory_known_ =
++        !best_factory_url.empty() && parse_hex(best_factory_sha256, this->factory_sha256_.data(), 32);
++    this->factory_url_ = this->factory_known_ ? best_factory_url : std::string();
++    this->minimal_known_ =
++        !best_minimal_url.empty() && parse_hex(best_minimal_sha256, this->minimal_sha256_.data(), 32);
++    this->minimal_url_ = this->minimal_known_ ? best_minimal_url : std::string();
++    this->minimal_revision_ = this->minimal_known_ ? best_minimal_revision : 0;
+ 
+     ESP_LOGD(TAG, "Best compatible version: %s", this->update_info_.latest_version.c_str());
+ 
+     return true;
+   });
++}
++#endif
++
++#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
++void Esp32HostedUpdate::fetch_manifest_() {
++  ESP_LOGD(TAG, "Fetching manifest");
++  this->container_ = this->http_request_parent_->begin(this->source_url_, "GET", std::string(), {}, {},
++                                                       this->http_request_parent_->get_timeout());
++  if (this->container_ == nullptr) {
++    this->manifest_failed_(LOG_STR("Failed to fetch manifest"));
++    return;
++  }
++  this->manifest_reading_ = false;
++  this->defer([this]() { this->manifest_step_(); });
++}
+ 
+-  if (!valid) {
++void Esp32HostedUpdate::manifest_step_() {
++  if (this->container_ == nullptr)
++    return;
++  if (!this->manifest_reading_) {
++    const auto progress = this->container_->poll();
++    if (progress == http_request::HttpRequestProgress::HTTP_REQUEST_PROGRESS_PENDING) {
++      this->defer([this]() { this->manifest_step_(); });
++      return;
++    }
++    if (progress != http_request::HttpRequestProgress::HTTP_REQUEST_PROGRESS_DONE ||
++        this->container_->status_code != 200) {
++      this->manifest_failed_(LOG_STR("Failed to fetch manifest"));
++      return;
++    }
++    this->manifest_reading_ = true;
++    this->manifest_json_.clear();
++    this->manifest_json_.reserve(this->container_->content_length);
++    this->last_data_time_ = millis();
++  }
++  uint8_t buf[256];
++  const int read_or_error = this->container_->read_available(buf, sizeof(buf));
++  const auto result = http_request::http_read_loop_result(read_or_error, this->last_data_time_,
++                                                         this->http_request_parent_->get_timeout(),
++                                                         this->container_->is_read_complete());
++  if (result == http_request::HttpReadLoopResult::DATA)
++    this->manifest_json_.append(reinterpret_cast<char *>(buf), read_or_error);
++  if (result == http_request::HttpReadLoopResult::RETRY ||
++      (result == http_request::HttpReadLoopResult::DATA &&
++       this->container_->get_bytes_read() < this->container_->content_length)) {
++    this->defer([this]() { this->manifest_step_(); });
++    return;
++  }
++  if (result == http_request::HttpReadLoopResult::ERROR || result == http_request::HttpReadLoopResult::TIMEOUT) {
++    this->manifest_failed_(LOG_STR("Failed to fetch manifest"));
++    return;
++  }
++  this->container_->end();
++  this->container_.reset();
++  const bool parsed = this->parse_manifest_(this->manifest_json_);
++  std::string().swap(this->manifest_json_);
++  this->checking_ = false;
++  if (!parsed) {
+     ESP_LOGE(TAG, "Failed to parse manifest JSON");
+     this->status_set_error(LOG_STR("Failed to parse manifest"));
+-    return false;
++    return;
+   }
++  this->finish_check_();
++}
+ 
+-  return true;
++void Esp32HostedUpdate::manifest_failed_(const LogString *what) {
++  ESP_LOGE(TAG, "%s from %s", LOG_STR_ARG(what), this->source_url_);
++  if (this->container_ != nullptr) {
++    this->container_->end();
++    this->container_.reset();
++  }
++  std::string().swap(this->manifest_json_);
++  this->checking_ = false;
++  this->status_set_error(what);
+ }
+ 
+-bool Esp32HostedUpdate::stream_firmware_to_coprocessor_() {
++bool Esp32HostedUpdate::open_download_() {
+   ESP_LOGI(TAG, "Downloading firmware");
+-
+-  auto container = this->http_request_parent_->get(this->firmware_url_);
+-  if (container == nullptr || container->status_code != 200) {
++  this->container_ = this->http_request_parent_->get(this->firmware_url_);
++  if (this->container_ == nullptr || this->container_->status_code != 200 || this->container_->content_length == 0) {
+     ESP_LOGE(TAG, "Failed to fetch firmware");
+     this->status_set_error(LOG_STR("Failed to fetch firmware"));
+     return false;
+   }
++  this->total_ = this->container_->content_length;
++  this->last_data_time_ = millis();
++  return true;
++}
+ 
+-  size_t total_size = container->content_length;
+-  ESP_LOGI(TAG, "Firmware size: %zu bytes", total_size);
++void Esp32HostedUpdate::read_download_() {
++  // NOTE: HttpContainer::read() has non-BSD socket semantics - see http_request.h
++  const size_t want = static_cast<size_t>(std::min<uint64_t>(CHUNK_SIZE, this->total_ - this->offset_));
++  const int read_or_error = this->container_->read(this->chunk_, want);
++  const auto result = http_request::http_read_loop_result(read_or_error, this->last_data_time_,
++                                                         this->http_request_parent_->get_timeout(),
++                                                         this->container_->is_read_complete());
++  if (result == http_request::HttpReadLoopResult::RETRY) {
++    this->defer([this]() { this->read_download_(); });
++    return;
++  }
++  if (result != http_request::HttpReadLoopResult::DATA) {
++    ESP_LOGE(TAG, "Error reading firmware data: %d", read_or_error);
++    this->status_set_error(LOG_STR("Download failed"));
++    this->install_done_(false);
++    return;
++  }
++  this->got_ = static_cast<size_t>(read_or_error);
++  this->on_chunk_();
++}
++#endif
+ 
+-  // Begin OTA on coprocessor
+-  esp_err_t err;
+-  {
+-    watchdog::WatchdogManager wdt(OTA_WDT_TIMEOUT_MS);
+-    err = esp_hosted_slave_ota_begin();  // NOLINT
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++void Esp32HostedUpdate::set_storage_path(const std::string &path) {
++  if (this->busy_)
++    return;
++  this->storage_path_ = path;
++  if (this->method_ == UpdateMethod::STORAGE && this->is_manifest_()) {
++    this->firmware_url_.clear();
++    this->update_info_.latest_version.clear();
++    this->state_ = update::UPDATE_STATE_NO_UPDATE;
+   }
+-  if (err != ESP_OK) {
+-    ESP_LOGE(TAG, "Failed to begin OTA: %s", esp_err_to_name(err));
+-    container->end();
+-    this->status_set_error(LOG_STR("Failed to begin OTA"));
++}
++
++bool Esp32HostedUpdate::is_manifest_() const {
++  const size_t n = this->storage_path_.size();
++  return n > 5 && strcasecmp(this->storage_path_.c_str() + n - 5, ".json") == 0;
++}
++
++storage::PathStorage *Esp32HostedUpdate::open_storage_(const std::string &path, const char **rel, uint64_t *size) {
++  storage::PathStorage *ps = storage::global_storage_registry == nullptr
++                                 ? nullptr
++                                 : storage::global_storage_registry->resolve_path(path.c_str(), rel);
++  storage::FileStat st{};
++  if (ps == nullptr || *rel == nullptr || storage::global_storage_worker == nullptr ||
++      storage::global_storage_worker->has_active_task_io(ps) ||
++      ps->stat(*rel, &st) != storage::StorageError::STORAGE_ERROR_OK || st.is_dir || st.size == 0) {
++    ESP_LOGE(TAG, "'%s' is not a readable file on a mounted storage", path.c_str());
++    return nullptr;
++  }
++  *size = st.size;
++  return ps;
++}
++
++void Esp32HostedUpdate::close_stream_() {
++  if (this->stream_open_) {
++    this->stream_open_ = false;
++    storage::global_storage_worker->end_read(this->stream_, [](storage::StorageError) {});
++  }
++}
++
++void Esp32HostedUpdate::storage_check_() {
++  this->busy_ = true;
++  const storage::StorageError err = storage::text::load(
++      this->storage_path_, [this](storage::StorageError e, const char *text, size_t len) {
++        if (e != storage::StorageError::STORAGE_ERROR_OK) {
++          this->storage_check_done_(false, storage::error_to_string(e));
++          return;
++        }
++        this->storage_check_done_(this->parse_manifest_(std::string(text, len)), "no usable entry");
++      });
++  if (err != storage::StorageError::STORAGE_ERROR_OK)
++    this->storage_check_done_(false, storage::error_to_string(err));
++}
++
++void Esp32HostedUpdate::storage_check_done_(bool ok, const char *why) {
++  const bool install = this->install_after_check_;
++  this->install_after_check_ = false;
++  this->busy_ = false;
++  if (!ok) {
++    if (install) {
++      ESP_LOGE(TAG, "No manifest at %s (%s)", this->storage_path_.c_str(), why);
++      this->install_failed_(LOG_STR("Manifest not readable"));
++      return;
++    }
++    ESP_LOGD(TAG, "No manifest at %s (%s)", this->storage_path_.c_str(), why);
++    this->publish_state();
++    return;
++  }
++  if (!this->firmware_url_.empty() && this->firmware_url_[0] != '/') {
++    const size_t slash = this->storage_path_.rfind('/');
++    this->firmware_url_.insert(0, this->storage_path_, 0, slash + 1);
++  }
++  if (!this->factory_url_.empty() && this->factory_url_[0] != '/') {
++    const size_t slash = this->storage_path_.rfind('/');
++    this->factory_url_.insert(0, this->storage_path_, 0, slash + 1);
++  }
++  if (!this->minimal_url_.empty() && this->minimal_url_[0] != '/') {
++    const size_t slash = this->storage_path_.rfind('/');
++    this->minimal_url_.insert(0, this->storage_path_, 0, slash + 1);
++  }
++  this->finish_check_();
++  if (!install)
++    return;
++  bool wanted = this->force_ || this->state_ == update::UPDATE_STATE_AVAILABLE;
++#ifdef USE_ESP32_HOSTED_SERIAL
++  wanted = wanted || this->serial_wanted_;
++#endif
++  if (!wanted) {
++    ESP_LOGI(TAG, "C6 is up to date");
++#if defined(USE_ESP32_HOSTED_UPDATE_SAFE_MODE) && defined(USE_SAFE_MODE_SPLIT)
++    if (this->normal_after_flash_) {
++      this->normal_after_flash_ = false;
++      this->safe_mode_->go_normal();
++    }
++#endif
++    return;
++  }
++  if (this->firmware_url_.empty()) {
++    this->install_failed_(LOG_STR("No firmware in the manifest"));
++    return;
++  }
++  this->prev_state_ = this->state_;
++  this->state_ = update::UPDATE_STATE_INSTALLING;
++  this->update_info_.has_progress = false;
++  this->publish_state();
++  this->busy_ = true;
++  this->begin_install_();
++}
++
++bool Esp32HostedUpdate::open_storage_read_() {
++  const std::string &path = this->is_manifest_() ? this->firmware_url_ : this->storage_path_;
++  ESP_LOGI(TAG, "Reading firmware from '%s'", path.c_str());
++  const char *rel = nullptr;
++  storage::PathStorage *ps = this->open_storage_(path, &rel, &this->total_);
++  if (ps == nullptr) {
++    this->status_set_error(LOG_STR("Firmware file not readable"));
+     return false;
+   }
++  const storage::StorageError err =
++      storage::global_storage_worker->begin_read(ps, rel, &this->stream_, [this](storage::StorageError e) {
++        if (e != storage::StorageError::STORAGE_ERROR_OK) {
++          ESP_LOGE(TAG, "Opening the firmware failed (%s)", storage::error_to_string(e));
++          this->status_set_error(LOG_STR("Firmware read failed"));
++          this->install_done_(false);
++          return;
++        }
++        this->start_ota_();
++      });
++  this->stream_open_ = err == storage::StorageError::STORAGE_ERROR_OK;
++  if (!this->stream_open_)
++    this->status_set_error(LOG_STR("Firmware read failed"));
++  return this->stream_open_;
++}
+ 
+-  // Stream firmware to coprocessor while computing SHA256
+-  // NOTE: HttpContainer::read() has non-BSD socket semantics - see http_request.h
+-  // Use http_read_loop_result() helper instead of checking return values directly
+-  sha256::SHA256 hasher;
+-  hasher.init();
+-
+-  uint8_t buffer[CHUNK_SIZE];
+-  uint32_t last_data_time = millis();
+-  const uint32_t read_timeout = this->http_request_parent_->get_timeout();
+-  while (container->get_bytes_read() < total_size) {
+-    int read_or_error = container->read(buffer, sizeof(buffer));
+-
+-    // Feed watchdog and give other tasks a chance to run
+-    App.feed_wdt();
+-    yield();
+-
+-    auto result =
+-        http_request::http_read_loop_result(read_or_error, last_data_time, read_timeout, container->is_read_complete());
+-    if (result == http_request::HttpReadLoopResult::RETRY)
+-      continue;
+-    // Note: COMPLETE is currently unreachable since the loop condition checks bytes_read < content_length,
+-    // but this is defensive code in case chunked transfer encoding support is added in the future.
+-    if (result == http_request::HttpReadLoopResult::COMPLETE)
+-      break;
+-    if (result != http_request::HttpReadLoopResult::DATA) {
+-      if (result == http_request::HttpReadLoopResult::TIMEOUT) {
+-        ESP_LOGE(TAG, "Timeout reading firmware data");
+-      } else {
+-        ESP_LOGE(TAG, "Error reading firmware data: %d", read_or_error);
++void Esp32HostedUpdate::read_storage_() {
++  const size_t want = static_cast<size_t>(std::min<uint64_t>(CHUNK_SIZE, this->total_ - this->offset_));
++  this->got_ = 0;
++  const storage::StorageError err = storage::global_storage_worker->read_chunk(
++      this->stream_, this->chunk_, want, &this->got_, [this](storage::StorageError e) {
++        if (e != storage::StorageError::STORAGE_ERROR_OK || this->got_ == 0) {
++          ESP_LOGE(TAG, "Read failed at %llu", static_cast<unsigned long long>(this->offset_));
++          this->status_set_error(LOG_STR("Firmware read failed"));
++          this->install_done_(false);
++          return;
++        }
++        this->on_chunk_();
++      });
++  if (err != storage::StorageError::STORAGE_ERROR_OK) {
++    this->status_set_error(LOG_STR("Firmware read failed"));
++    this->install_done_(false);
++  }
++}
++#endif
++
++void Esp32HostedUpdate::install_failed_(const LogString *what) {
++  this->status_set_error(what);
++  this->busy_ = false;
++  this->state_ = this->prev_state_;
++  this->publish_state();
++  this->progress_trigger_.trigger(-1);
++}
++
++void Esp32HostedUpdate::enter_safe_() {
++#if defined(USE_ESP32_HOSTED_UPDATE_SAFE_MODE) && defined(USE_SAFE_MODE_SPLIT)
++  if (this->safe_mode_ != nullptr) {
++    if (this->safe_mode_->get_level() == safe_mode::LEVEL_NORMAL) {
++      if (!this->safe_mode_->switch_to_safe_mode()) {
++        ESP_LOGW(TAG, "C6 update refused: %s", this->safe_mode_->get_refusal());
++        this->status_set_error(LOG_STR("Safe mode refused"));
++        this->busy_ = false;
++        this->state_ = this->prev_state_;
++        this->publish_state();
++        return;
+       }
+-      ota_end_guarded();
+-      container->end();
+-      this->status_set_error(LOG_STR("Download failed"));
+-      return false;
++      this->normal_after_flash_ = true;
++    }
++    if (!this->safe_mode_->is_safe_ready()) {
++      this->await_safe_ = true;
++      return;
+     }
++  }
++#endif
++  this->safe_install_();
++}
+ 
+-    hasher.add(buffer, read_or_error);
+-    err = esp_hosted_slave_ota_write(buffer, read_or_error);  // NOLINT
+-    if (err != ESP_OK) {
+-      ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
+-      ota_end_guarded();
+-      container->end();
+-      this->status_set_error(LOG_STR("Failed to write OTA data"));
+-      return false;
++void Esp32HostedUpdate::safe_install_() {
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  if (this->method_ == UpdateMethod::STORAGE && this->is_manifest_()) {
++    this->state_ = this->prev_state_;
++    this->install_after_check_ = true;
++    this->storage_check_();
++    return;
++  }
++#endif
++  this->begin_install_();
++}
++
++#if defined(USE_ESP32_HOSTED_SERIAL) && \
++    (defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE))
++void Esp32HostedUpdate::perform_serial() {
++  if (this->busy_) {
++    ESP_LOGW(TAG, "Busy");
++    return;
++  }
++  this->serial_wanted_ = true;
++  this->perform(true);
++  if (!this->busy_)
++    this->serial_wanted_ = false;
++}
++#endif
++
++void Esp32HostedUpdate::perform(bool force) {
++#if defined(USE_ESP32_HOSTED_UPDATE_SAFE_MODE) && defined(USE_SAFE_MODE_SPLIT)
++  if (this->await_safe_ && this->safe_mode_ != nullptr && this->safe_mode_->get_level() == safe_mode::LEVEL_NORMAL) {
++    this->await_safe_ = false;
++    this->busy_ = false;
++    this->state_ = this->prev_state_;
++  }
++#endif
++  if (this->busy_) {
++    ESP_LOGW(TAG, "Busy");
++    return;
++  }
++  bool recheck = false;
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  recheck = this->method_ == UpdateMethod::STORAGE && this->is_manifest_();
++#endif
++  if (!recheck && this->state_ != update::UPDATE_STATE_AVAILABLE && !force) {
++    ESP_LOGW(TAG, "Update not available");
++    return;
++  }
++
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++  if (this->method_ == UpdateMethod::HTTP && this->firmware_url_.empty()) {
++    ESP_LOGW(TAG, "No firmware URL available, run check first");
++    return;
++  }
++#endif
++
++#ifdef USE_ESP32_HOSTED_EMBEDDED_UPDATE
++  if (this->method_ == UpdateMethod::EMBEDDED) {
++    if (this->firmware_data_ == nullptr || this->firmware_size_ == 0) {
++      ESP_LOGE(TAG, "No firmware data available");
++      this->status_set_error(LOG_STR("No firmware data available"));
++      return;
++    }
++    // Verify SHA256 before writing
++    sha256::SHA256 hasher;
++    hasher.init();
++    hasher.add(this->firmware_data_, this->firmware_size_);
++    hasher.calculate();
++    if (!hasher.equals_bytes(this->firmware_sha256_.data())) {
++      ESP_LOGE(TAG, "SHA256 mismatch");
++      this->status_set_error(LOG_STR("SHA256 verification failed"));
++      return;
+     }
+   }
+-  container->end();
++#endif
+ 
+-  // Verify SHA256
+-  hasher.calculate();
+-  if (!hasher.equals_bytes(this->firmware_sha256_.data())) {
+-    ESP_LOGE(TAG, "SHA256 mismatch");
+-    ota_end_guarded();
+-    this->status_set_error(LOG_STR("SHA256 verification failed"));
+-    return false;
++  this->prev_state_ = this->state_;
++  this->state_ = update::UPDATE_STATE_INSTALLING;
++  this->update_info_.has_progress = false;
++  this->publish_state();
++  this->busy_ = true;
++  this->force_ = force;
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++  this->fallback_ = false;
++#endif
++  this->enter_safe_();
++}
++
++void Esp32HostedUpdate::begin_install_() {
++#if defined(USE_ESP32_HOSTED_SERIAL) && \
++    (defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE))
++  if (this->serial_wanted_) {
++    this->serial_wanted_ = false;
++    if (!this->serial_enabled_ || !this->factory_known_) {
++      ESP_LOGE(TAG, "No C6 factory image or no serial route");
++      this->install_failed_(LOG_STR("No C6 factory image"));
++      return;
++    }
++    this->fallback_ = true;
++    this->firmware_url_ = this->factory_url_;
++    this->firmware_sha256_ = this->factory_sha256_;
++  }
++#endif
++  this->chunk_ = RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).allocate(CHUNK_SIZE);
++  if (this->chunk_ == nullptr) {
++    ESP_LOGE(TAG, "No memory for the transfer");
++    this->status_set_error(LOG_STR("No memory"));
++    this->install_done_(false);
++    return;
++  }
++  this->offset_ = 0;
++  this->hasher_.init();
++  switch (this->method_) {
++#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
++    case UpdateMethod::HTTP:
++      if (!this->open_download_()) {
++        this->install_done_(false);
++        return;
++      }
++      this->start_ota_();
++      return;
++#endif
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++    case UpdateMethod::STORAGE:
++      if (!this->open_storage_read_())
++        this->install_done_(false);
++      return;
++#endif
++#ifdef USE_ESP32_HOSTED_EMBEDDED_UPDATE
++    case UpdateMethod::EMBEDDED:
++      ESP_LOGI(TAG, "Starting OTA update (%zu bytes)", this->firmware_size_);
++      this->total_ = this->firmware_size_;
++      this->start_ota_();
++      return;
++#endif
++    default:
++      this->install_done_(false);
++      return;
+   }
++}
+ 
+-  ESP_LOGI(TAG, "SHA256 verified successfully");
+-  return true;
++static bool other_network() {
++#ifdef USE_ETHERNET
++  if (ethernet::global_eth_component != nullptr && ethernet::global_eth_component->is_connected())
++    return true;
++#endif
++#ifdef USE_USB_ETHERNET
++  if (usb_ethernet::global_usb_ethernet != nullptr && usb_ethernet::global_usb_ethernet->is_connected())
++    return true;
++#endif
++  return false;
+ }
+-#else
+-bool Esp32HostedUpdate::write_embedded_firmware_to_coprocessor_() {
+-  if (this->firmware_data_ == nullptr || this->firmware_size_ == 0) {
+-    ESP_LOGE(TAG, "No firmware data available");
+-    this->status_set_error(LOG_STR("No firmware data available"));
+-    return false;
++
++void Esp32HostedUpdate::update_announce_() {
++  this->busy_ = true;
++#if defined(USE_ESP32_HOSTED_UPDATE_SAFE_MODE) && defined(USE_SAFE_MODE_SPLIT)
++  if (this->safe_mode_ != nullptr && this->safe_mode_->get_level() == safe_mode::LEVEL_NORMAL) {
++    this->normal_after_flash_ = true;
++    this->safe_mode_->switch_to_safe_mode();
++  }
++#endif
++  this->progress_trigger_.trigger(0);
++  if (other_network()) {
++    this->update_start_();
++    return;
++  }
++  ESP_LOGW(TAG, "Wi-Fi is the only network: offline during the C6 update, back by itself");
++  this->update_info_.summary = "C6 update: Wi-Fi goes down, the device comes back by itself";
++  this->publish_state();
++  this->set_timeout(UPDATE_NOTICE_MS, [this]() { this->update_start_(); });
++}
++
++void Esp32HostedUpdate::update_start_() {
++  this->update_pause_();
++  TaskFunction_t task = slot_task_;
++#ifdef USE_ESP32_HOSTED_SERIAL
++  if (this->serial_route_ && !this->slot_return_)
++    task = serial_flash_task_;
++#endif
++  if (this->flash_task_.create(task, "c6_update", UPDATE_TASK_STACK, this, UPDATE_TASK_PRIORITY, true))
++    return;
++  ESP_LOGE(TAG, "No task for the C6 update");
++  this->update_resume_(false, true);
++}
++
++void Esp32HostedUpdate::update_pause_() {
++#ifdef USE_WIFI
++  if (!this->wifi_after_flash_ && wifi::global_wifi_component != nullptr &&
++      !wifi::global_wifi_component->is_disabled()) {
++    this->wifi_after_flash_ = true;
++    wifi::global_wifi_component->disable();
++    esp_wifi_deinit();
++  }
++#endif
++#ifdef USE_USB_BLUETOOTH_C6_OFFLOAD
++  usb_bluetooth::c6_offload::set_paused(true);
++#endif
++}
++
++void Esp32HostedUpdate::update_progress_(void *ctx, uint8_t percent) {
++  auto *self = static_cast<Esp32HostedUpdate *>(ctx);
++  ESP_LOGI(TAG, "C6 update %u %%", percent);
++  self->defer([self, percent]() {
++    self->update_info_.has_progress = true;
++    self->update_info_.progress = percent;
++    self->publish_state();
++    self->progress_trigger_.trigger(percent);
++  });
++}
++
++void Esp32HostedUpdate::slot_on_state_(uint32_t msg_id, const uint8_t *data, size_t len, void *ctx) {
++  auto *self = static_cast<Esp32HostedUpdate *>(ctx);
++  if (len < SLOT_STATE_MIN)
++    return;
++  self->slot_ = {};
++  std::memcpy(&self->slot_, data, std::min<size_t>(len, sizeof(SlotState)));
++  TaskHandle_t waiter = self->slot_waiter_;
++  if (waiter != nullptr) {
++    xTaskNotifyGive(waiter);
++    return;
++  }
++  self->defer([self]() { self->slot_answered_(); });
++}
++
++void Esp32HostedUpdate::slot_query_(bool install) {
++  this->slot_install_ = install;
++  this->slot_ = {};
++  esp_hosted_register_custom_callback(SLOT_MSG_STATE, slot_on_state_, this);
++  const uint8_t command = SLOT_QUERY;
++  this->set_timeout(SLOT_TIMEOUT_ID, SLOT_ANSWER_MS, [this]() { this->slot_no_answer_(); });
++  if (esp_hosted_send_custom_data(SLOT_MSG_COMMAND, &command, sizeof(command)) != ESP_OK) {
++    this->cancel_timeout(SLOT_TIMEOUT_ID);
++    this->slot_no_answer_();
+   }
++}
++
++bool Esp32HostedUpdate::offload_offered_() const {
++  return this->update_info_.latest_version.find("+xbt.") != std::string::npos;
++}
+ 
+-  // Verify SHA256 before writing
+-  sha256::SHA256 hasher;
+-  hasher.init();
+-  hasher.add(this->firmware_data_, this->firmware_size_);
+-  hasher.calculate();
+-  if (!hasher.equals_bytes(this->firmware_sha256_.data())) {
+-    ESP_LOGE(TAG, "SHA256 mismatch");
+-    this->status_set_error(LOG_STR("SHA256 verification failed"));
++bool Esp32HostedUpdate::stock_offered_() const {
++  if (this->method_ == UpdateMethod::EMBEDDED)
+     return false;
++  const std::string &version = this->update_info_.latest_version;
++  return !version.empty() && version != "storage" && version.find("+xbt.") == std::string::npos;
++}
++
++void Esp32HostedUpdate::switch_reset_() {
++  if (this->main_image_ != nullptr) {
++    RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).deallocate(this->main_image_, this->main_total_);
++    this->main_image_ = nullptr;
++  }
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++  if (this->minimal_first_) {
++    this->firmware_url_ = this->main_url_;
++    this->firmware_sha256_ = this->main_sha256_;
++  }
++#endif
++  this->minimal_first_ = false;
++}
++
++void Esp32HostedUpdate::slot_no_answer_() {
++  if (!this->slot_install_)
++    return;
++  this->slot_install_ = false;
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++  if (this->minimal_first_) {
++    this->update_announce_();
++    return;
+   }
++  if (this->offload_offered_()) {
++    if (!this->minimal_known_) {
++      ESP_LOGE(TAG, "No minimal image in the manifest: the stock C6 firmware stays");
++      this->status_set_error(LOG_STR("No minimal image"));
++      this->image_free_();
++      this->busy_ = false;
++      this->state_ = this->prev_state_;
++      this->publish_state();
++      return;
++    }
++    ESP_LOGI(TAG, "C6 runs the stock firmware: minimal image first");
++    this->fetch_minimal_();
++    return;
++  }
++#endif
++  this->ota_image_start_();
++}
+ 
+-  ESP_LOGI(TAG, "Starting OTA update (%zu bytes)", this->firmware_size_);
++void Esp32HostedUpdate::fetch_minimal_() {
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++  this->main_image_ = this->image_;
++  this->main_total_ = this->total_;
++  this->image_ = nullptr;
++  this->main_url_ = this->firmware_url_;
++  this->main_sha256_ = this->firmware_sha256_;
++  this->firmware_url_ = this->minimal_url_;
++  this->firmware_sha256_ = this->minimal_sha256_;
++  this->minimal_first_ = true;
++  this->begin_install_();
++#endif
++}
+ 
+-  esp_err_t err;
+-  {
+-    watchdog::WatchdogManager wdt(OTA_WDT_TIMEOUT_MS);
+-    err = esp_hosted_slave_ota_begin();  // NOLINT
++void Esp32HostedUpdate::slot_answered_() {
++  this->cancel_timeout(SLOT_TIMEOUT_ID);
++  ESP_LOGD(TAG, "C6 slot: %s, other slot %s", this->slot_.minimal != 0 ? "minimal" : "main",
++           this->slot_.other_valid != 0 ? "valid" : "empty");
++  if (this->slot_install_) {
++    this->slot_install_ = false;
++    if (this->slot_.minimal == 0 && this->slot_.other_valid == 0) {
++      ESP_LOGE(TAG, "The C6 has no minimal firmware: no update over esp_hosted");
++      this->status_set_error(LOG_STR("C6 has no minimal firmware"));
++      this->image_free_();
++      this->busy_ = false;
++      this->state_ = this->prev_state_;
++      this->publish_state();
++      return;
++    }
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++    if (!this->minimal_first_ && this->offload_offered_() && this->minimal_known_ &&
++        this->slot_.revision < this->minimal_revision_) {
++      ESP_LOGI(TAG, "C6 minimal image revision %u, offered %u: it is renewed first", this->slot_.revision,
++               this->minimal_revision_);
++      this->fetch_minimal_();
++      return;
++    }
++#endif
++    this->update_announce_();
++    return;
++  }
++  if (this->slot_.minimal != 0 && this->slot_.other_valid != 0 && !this->busy_) {
++    ESP_LOGW(TAG, "C6 is in its minimal firmware: back to main");
++    this->slot_return_ = true;
++    this->update_announce_();
++  } else if (this->slot_.minimal != 0 && this->slot_.other_valid == 0) {
++    ESP_LOGW(TAG, "C6 is in its minimal firmware and has no main firmware: update it");
++    this->update_info_.summary = "C6 has no main firmware";
++    this->status_set_error(LOG_STR("C6 has no main firmware"));
++    this->publish_state();
++  }
++}
++
++bool Esp32HostedUpdate::slot_command_(uint8_t command, uint8_t arg, uint32_t wait_ms) {
++  const uint8_t message[2] = {command, arg};
++  const size_t len = command == SLOT_TABLE ? 2 : 1;
++  this->slot_waiter_ = xTaskGetCurrentTaskHandle();
++  ulTaskNotifyTake(pdTRUE, 0);
++  bool answered = esp_hosted_send_custom_data(SLOT_MSG_COMMAND, message, len) == ESP_OK;
++  answered = answered && ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait_ms != 0 ? wait_ms : SLOT_ANSWER_MS)) > 0;
++  this->slot_waiter_ = nullptr;
++  if (answered && this->slot_.result != 0)
++    ESP_LOGE(TAG, "C6 slot command %u failed: 0x%x", command,
++             static_cast<unsigned>(this->slot_.error_low | (this->slot_.error_high << 8)));
++  return answered && this->slot_.result == 0;
++}
++
++bool Esp32HostedUpdate::hosted_restart_() {
++  esp_hosted_deinit();
++  int rc = esp_hosted_init();
++  if (rc == 0)
++    rc = esp_hosted_connect_to_slave();
++  this->hosted_up_ = rc == 0;
++  if (this->hosted_up_) {
++    ESP_LOGI(TAG, "The C6 is ready");
++  } else {
++    ESP_LOGE(TAG, "The C6 did not come back: %d", rc);
+   }
++  return this->hosted_up_;
++}
++
++bool Esp32HostedUpdate::slot_switch_(bool minimal) {
++  uint8_t command = SLOT_BOOT_OTHER;
++  if (this->slot_.commands >= SLOT_BOOT_MINIMAL)
++    command = minimal ? SLOT_BOOT_MINIMAL : SLOT_BOOT_MAIN;
++  if (!this->slot_command_(command) || !this->hosted_restart_() || !this->slot_command_(SLOT_QUERY))
++    return false;
++  return (this->slot_.minimal != 0) == minimal;
++}
++
++bool Esp32HostedUpdate::slot_write_() {
++  esp_err_t err = esp_hosted_slave_ota_begin();
+   if (err != ESP_OK) {
+     ESP_LOGE(TAG, "Failed to begin OTA: %s", esp_err_to_name(err));
+-    this->status_set_error(LOG_STR("Failed to begin OTA"));
+     return false;
+   }
++  uint8_t reported = 0;
++  for (uint64_t at = 0; at < this->total_;) {
++    const size_t len = static_cast<size_t>(std::min<uint64_t>(CHUNK_SIZE, this->total_ - at));
++    err = esp_hosted_slave_ota_write(this->image_ + at, len);
++    if (err != ESP_OK) {
++      ESP_LOGE(TAG, "Failed to write OTA data at %llu: %s", static_cast<unsigned long long>(at), esp_err_to_name(err));
++      esp_hosted_slave_ota_end();
++      return false;
++    }
++    at += len;
++    const uint8_t percent = static_cast<uint8_t>(at * 100 / this->total_);
++    if (percent >= reported + SLOT_PROGRESS_STEP) {
++      reported = percent;
++      update_progress_(this, percent);
++    }
++  }
++  err = esp_hosted_slave_ota_end();
++  if (err != ESP_OK)
++    ESP_LOGE(TAG, "Failed to end OTA: %s", esp_err_to_name(err));
++  return err == ESP_OK;
++}
+ 
+-  uint8_t chunk[CHUNK_SIZE];
+-  const uint8_t *data_ptr = this->firmware_data_;
+-  size_t remaining = this->firmware_size_;
+-  while (remaining > 0) {
+-    size_t chunk_size = std::min(remaining, static_cast<size_t>(CHUNK_SIZE));
+-    memcpy(chunk, data_ptr, chunk_size);
+-    err = esp_hosted_slave_ota_write(chunk, chunk_size);  // NOLINT
++bool Esp32HostedUpdate::install_with_minimal_() {
++  if (this->slot_.commands == 0) {
++    if (!this->slot_write_())
++      return false;
++    const esp_err_t err = esp_hosted_slave_ota_activate();
+     if (err != ESP_OK) {
+-      ESP_LOGE(TAG, "Failed to write OTA data: %s", esp_err_to_name(err));
+-      ota_end_guarded();
+-      this->status_set_error(LOG_STR("Failed to write OTA data"));
++      ESP_LOGE(TAG, "Failed to activate the minimal image: %s", esp_err_to_name(err));
++      return false;
++    }
++    if (!this->hosted_restart_() || !this->slot_command_(SLOT_QUERY))
++      return false;
++  } else {
++    if (this->slot_.minimal == 0 && !this->slot_switch_(true))
++      return false;
++    if (!this->slot_write_())
++      return false;
++    if (!this->slot_command_(this->slot_.commands >= SLOT_BOOT_MINIMAL ? SLOT_BOOT_MAIN : SLOT_BOOT_OTHER) ||
++        !this->hosted_restart_() || !this->slot_command_(SLOT_QUERY))
++      return false;
++  }
++  if (this->slot_.minimal == 0 || this->slot_.commands < SLOT_TABLE) {
++    ESP_LOGE(TAG, "The C6 does not run a minimal image that can switch");
++    return false;
++  }
++  if (this->slot_.table != SLOT_TABLE_OURS) {
++    if (this->slot_.first == 0 && !this->slot_command_(SLOT_CLONE, 0, SLOT_CLONE_MS))
++      return false;
++    if (!this->slot_command_(SLOT_TABLE, SLOT_TABLE_OURS, SLOT_TABLE_MS) || !this->hosted_restart_() ||
++        !this->slot_command_(SLOT_QUERY))
++      return false;
++    if (this->slot_.table != SLOT_TABLE_OURS || this->slot_.first == 0) {
++      ESP_LOGE(TAG, "The C6 did not come up on the new partition table");
++      return false;
++    }
++  }
++  if (this->slot_.first != 0) {
++    if (!this->slot_command_(SLOT_CLONE, 0, SLOT_CLONE_MS) || !this->slot_command_(SLOT_BOOT_OTHER) ||
++        !this->hosted_restart_() || !this->slot_command_(SLOT_QUERY))
++      return false;
++    if (this->slot_.first != 0 || this->slot_.minimal == 0) {
++      ESP_LOGE(TAG, "The C6 did not start its minimal image from its own slot");
+       return false;
+     }
+-    data_ptr += chunk_size;
+-    remaining -= chunk_size;
+-    App.feed_wdt();
+   }
++  this->image_free_();
++  this->image_ = this->main_image_;
++  this->total_ = this->main_total_;
++  this->main_image_ = nullptr;
++  return this->slot_write_();
++}
+ 
+-  return true;
++void Esp32HostedUpdate::slot_task_(void *arg) {
++  auto *self = static_cast<Esp32HostedUpdate *>(arg);
++  bool ok = true;
++  self->hosted_up_ = true;
++  if (self->minimal_first_) {
++    ok = self->install_with_minimal_();
++  } else if (!self->slot_return_) {
++    if (self->slot_.minimal == 0)
++      ok = self->slot_switch_(true);
++    const bool stock = ok && self->stock_offered_();
++    if (stock && (self->slot_.commands < SLOT_TABLE || self->total_ > STOCK_APP_SIZE)) {
++      ESP_LOGE(TAG, "Stock firmware not written: %s",
++               self->total_ > STOCK_APP_SIZE ? "image too large for the stock slot" : "the C6 minimal image is too old");
++      ok = false;
++    }
++    if (ok)
++      ok = self->slot_write_();
++    if (ok && stock) {
++      ok = self->slot_command_(SLOT_TABLE, SLOT_TABLE_STOCK, SLOT_TABLE_MS) && self->hosted_restart_();
++      if (ok)
++        self->slot_ = {};
++    }
++  }
++  if (self->hosted_up_ && self->slot_.minimal != 0) {
++#ifdef USE_USB_BLUETOOTH_C6_OFFLOAD
++    usb_bluetooth::c6_offload::set_paused(false);
++#endif
++    const bool main_up = self->slot_switch_(false);
++    ok = ok && main_up;
++  }
++  const bool back = self->hosted_up_;
++  self->defer([self, ok, back]() { self->update_resume_(ok, back); });
++  vTaskSuspend(nullptr);
++}
++
++#ifdef USE_ESP32_HOSTED_SERIAL
++void Esp32HostedUpdate::serial_flash_task_(void *arg) {
++  auto *self = static_cast<Esp32HostedUpdate *>(arg);
++  self->log_after_flash_ = self->log_on_ || self->log_restart_;
++  const bool reader = self->log_task_.is_created();
++  self->serial_log_stop_();
++  while (reader && !self->log_parked_.load(std::memory_order_acquire))
++    vTaskDelay(1);
++  esp_hosted_deinit();
++  bool ok = self->serial_.open();
++  if (ok) {
++    self->serial_.enter_bootloader();
++    ok = self->serial_.flash(self->image_, static_cast<uint32_t>(self->total_), update_progress_, self);
++    self->serial_.close();
++  }
++  self->serial_.leave_bootloader();
++  int rc = esp_hosted_init();
++  if (rc == 0)
++    rc = esp_hosted_connect_to_slave();
++  const bool back = rc == 0;
++  if (back) {
++    ESP_LOGI(TAG, "The C6 is ready");
++  } else {
++    ESP_LOGE(TAG, "The C6 did not come back: %d", rc);
++  }
++  self->defer([self, ok, back]() { self->update_resume_(ok, back); });
++  vTaskSuspend(nullptr);
+ }
+ #endif
+ 
+-void Esp32HostedUpdate::perform(bool force) {
+-  if (this->state_ != update::UPDATE_STATE_AVAILABLE && !force) {
+-    ESP_LOGW(TAG, "Update not available");
++void Esp32HostedUpdate::update_task_free_() {
++  if (!this->flash_task_.is_created())
++    return;
++  if (!this->flash_task_.deallocate())
++    this->set_timeout(UPDATE_FREE_RETRY_MS, [this]() { this->update_task_free_(); });
++}
++
++void Esp32HostedUpdate::update_resume_(bool ok, bool back) {
++  this->update_task_free_();
++  this->switch_reset_();
++#ifdef USE_USB_BLUETOOTH_C6_OFFLOAD
++  usb_bluetooth::c6_offload::set_paused(false);
++#endif
++#ifdef USE_WIFI
++  if (this->wifi_after_flash_ && back) {
++    this->wifi_after_flash_ = false;
++    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
++    if (sta != nullptr)
++      esp_netif_action_stop(sta, nullptr, 0, nullptr);
++    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
++    cfg.nvs_enable = false;
++    esp_err_t err = esp_wifi_init(&cfg);
++    if (err == ESP_OK)
++      err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
++    if (err != ESP_OK)
++      ESP_LOGE(TAG, "Wi-Fi not started again: %s", esp_err_to_name(err));
++    wifi::global_wifi_component->enable();
++  }
++#endif
++  this->image_free_();
++  this->busy_ = false;
++  this->update_info_.has_progress = false;
++#ifdef USE_ESP32_HOSTED_SERIAL
++  if (this->log_after_flash_) {
++    this->log_after_flash_ = false;
++    this->serial_log_start_();
++  }
++#endif
++  ok = ok && back;
++  const bool returned = this->slot_return_;
++  this->slot_return_ = false;
++  if (back)
++    this->read_version_();
++  if (ok && !returned && !this->update_info_.latest_version.empty() && this->update_info_.latest_version != "storage" &&
++      this->update_info_.latest_version != this->update_info_.current_version) {
++    ESP_LOGE(TAG, "C6 runs %s after the update to %s", this->update_info_.current_version.c_str(),
++             this->update_info_.latest_version.c_str());
++    ok = false;
++  }
++#if defined(USE_ESP32_HOSTED_SERIAL) && \
++    (defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE))
++  if (!ok && !returned && !this->serial_route_ && this->serial_enabled_ && this->factory_known_ && !this->fallback_) {
++    ESP_LOGW(TAG, "C6 update over esp_hosted failed: factory image over serial");
++    this->fallback_ = true;
++    this->firmware_url_ = this->factory_url_;
++    this->firmware_sha256_ = this->factory_sha256_;
++    this->busy_ = true;
++    this->begin_install_();
+     return;
+   }
++  this->fallback_ = false;
++#endif
++  if (ok) {
++    ESP_LOGI(TAG, "C6 %s, version %s", returned ? "back on main" : "updated", this->update_info_.current_version.c_str());
++    this->update_info_.summary = "";
++    if (!returned)
++      this->state_ = update::UPDATE_STATE_NO_UPDATE;
++    this->status_clear_error();
++  } else {
++    ESP_LOGE(TAG, "C6 update failed");
++    this->update_info_.summary = "C6 update failed";
++    if (!returned)
++      this->state_ = this->prev_state_;
++    this->status_set_error(LOG_STR("C6 update failed"));
++  }
++#if defined(USE_ESP32_HOSTED_UPDATE_SAFE_MODE) && defined(USE_SAFE_MODE_SPLIT)
++  if (ok && this->normal_after_flash_) {
++    this->normal_after_flash_ = false;
++    this->safe_mode_->go_normal();
++  }
++#endif
++  this->publish_state();
++  this->progress_trigger_.trigger(ok ? 100 : -1);
++}
+ 
+-#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-  if (this->firmware_url_.empty()) {
+-    ESP_LOGW(TAG, "No firmware URL available, run check first");
++#ifdef USE_ESP32_HOSTED_SERIAL
++void Esp32HostedUpdate::serial_settings_load_() {
++  this->serial_pref_ = this->make_entity_preference<SerialSettings>();
++  SerialSettings saved{};
++  if (!this->serial_pref_.load(&saved))
++    return;
++  this->serial_enabled_ = saved.enabled != 0;
++  this->serial_.set_pins(saved.uart_num, saved.tx_pin, saved.rx_pin, saved.boot_pin);
++}
++
++void Esp32HostedUpdate::set_serial_settings(bool enabled, uint8_t uart_num, int tx_pin, int rx_pin, int boot_pin) {
++  if (this->busy_)
++    return;
++  this->serial_log_stop_();
++  this->serial_enabled_ = enabled;
++  this->serial_.set_pins(uart_num, tx_pin, rx_pin, boot_pin);
++  SerialSettings saved{static_cast<uint8_t>(enabled), uart_num, static_cast<int8_t>(tx_pin), static_cast<int8_t>(rx_pin),
++                       static_cast<int8_t>(boot_pin)};
++  this->serial_pref_.save(&saved);
++  ESP_LOGI(TAG, "Serial route %s: UART %u, tx %d, rx %d, boot %d", enabled ? "on" : "off", uart_num, tx_pin, rx_pin,
++           boot_pin);
++}
++
++void Esp32HostedUpdate::serial_log_task_(void *arg) {
++  auto *self = static_cast<Esp32HostedUpdate *>(arg);
++  self->serial_.read_log(self->log_stop_);
++  self->serial_.close();
++  self->log_parked_.store(true, std::memory_order_release);
++  self->defer([self]() { self->serial_log_parked_(); });
++  vTaskSuspend(nullptr);
++}
++
++void Esp32HostedUpdate::serial_log_parked_() {
++  if (!this->log_task_.deallocate()) {
++    this->set_timeout(UPDATE_FREE_RETRY_MS, [this]() { this->serial_log_parked_(); });
++    return;
++  }
++  if (!this->log_restart_)
++    return;
++  this->log_restart_ = false;
++  if (this->busy_) {
++    this->log_after_flash_ = true;
+     return;
+   }
++  this->serial_log_start_();
++}
++
++bool Esp32HostedUpdate::serial_log_start_() {
++  if (this->log_on_)
++    return true;
++  if (!this->serial_enabled_)
++    return false;
++  if (this->log_task_.is_created()) {
++    this->log_restart_ = true;
++    return true;
++  }
++  if (!this->serial_.open())
++    return false;
++  this->log_stop_.store(false, std::memory_order_release);
++  this->log_parked_.store(false, std::memory_order_release);
++  if (!this->log_task_.create(serial_log_task_, "c6_uart_log", SERIAL_LOG_STACK, this, SERIAL_LOG_PRIORITY, true)) {
++    ESP_LOGE(TAG, "No task for the C6 UART log");
++    this->serial_.close();
++    return false;
++  }
++  this->log_on_ = true;
++  return true;
++}
++
++void Esp32HostedUpdate::serial_log_stop_() {
++  this->log_restart_ = false;
++  if (!this->log_on_)
++    return;
++  this->log_on_ = false;
++  this->log_stop_.store(true, std::memory_order_release);
++}
++
++void Esp32HostedUpdate::set_serial_log(bool on) {
++  if (this->busy_) {
++    this->log_after_flash_ = on;
++    return;
++  }
++  if (on) {
++    this->serial_log_start_();
++  } else {
++    this->serial_log_stop_();
++  }
++}
+ #endif
+ 
+-  update::UpdateState prev_state = this->state_;
+-  this->state_ = update::UPDATE_STATE_INSTALLING;
++void Esp32HostedUpdate::start_ota_() {
++  this->image_ = RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).allocate(this->total_);
++  if (this->image_ == nullptr) {
++    ESP_LOGE(TAG, "No memory for the image");
++    this->status_set_error(LOG_STR("No memory"));
++    this->install_done_(false);
++    return;
++  }
++  this->last_progress_ = millis();
++  this->next_chunk_();
++}
++
++void Esp32HostedUpdate::image_free_() {
++  if (this->image_ == nullptr)
++    return;
++  RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).deallocate(this->image_, this->total_);
++  this->image_ = nullptr;
++}
++
++void Esp32HostedUpdate::publish_progress_() {
++  const uint32_t now = millis();
++  if (now - this->last_progress_ < PROGRESS_MS)
++    return;
++  this->last_progress_ = now;
++  this->update_info_.has_progress = true;
++  this->update_info_.progress = this->offset_ * 100.0f / this->total_;
++  this->publish_state();
++}
++
++bool Esp32HostedUpdate::app_image_ok_() const {
++  constexpr size_t desc_offset = sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t);
++  return this->total_ >= desc_offset + sizeof(esp_app_desc_t) && this->image_[0] == ESP_IMAGE_HEADER_MAGIC &&
++         reinterpret_cast<const esp_app_desc_t *>(this->image_ + desc_offset)->magic_word == ESP_APP_DESC_MAGIC_WORD;
++}
++
++void Esp32HostedUpdate::ota_image_start_() {
++  esp_err_t err;
++  {
++    watchdog::WatchdogManager wdt(OTA_WDT_TIMEOUT_MS);
++    err = esp_hosted_slave_ota_begin();
++  }
++  if (err != ESP_OK) {
++    ESP_LOGE(TAG, "Failed to begin OTA: %s", esp_err_to_name(err));
++    this->ota_image_failed_(LOG_STR("Failed to begin OTA"));
++    return;
++  }
++  this->offset_ = 0;
++  this->last_progress_ = millis();
++  this->ota_image_step_();
++}
++
++void Esp32HostedUpdate::ota_image_step_() {
++  if (this->offset_ >= this->total_) {
++    this->image_free_();
++    this->ota_finish_();
++    return;
++  }
++  const size_t len = static_cast<size_t>(std::min<uint64_t>(CHUNK_SIZE, this->total_ - this->offset_));
++  const esp_err_t err = esp_hosted_slave_ota_write(this->image_ + this->offset_, len);
++  if (err != ESP_OK) {
++    ESP_LOGE(TAG, "Failed to write OTA data at %llu of %llu bytes: %s", static_cast<unsigned long long>(this->offset_),
++             static_cast<unsigned long long>(this->total_), esp_err_to_name(err));
++    ota_end_guarded();
++    this->ota_image_failed_(LOG_STR("Failed to write OTA data"));
++    return;
++  }
++  this->offset_ += len;
++  this->publish_progress_();
++  this->defer([this]() { this->ota_image_step_(); });
++}
++
++void Esp32HostedUpdate::ota_image_failed_(const LogString *what) {
++  this->status_set_error(what);
++  this->image_free_();
+   this->update_info_.has_progress = false;
++  this->busy_ = false;
++  this->state_ = this->prev_state_;
+   this->publish_state();
++}
+ 
++void Esp32HostedUpdate::next_chunk_() {
++  if (this->offset_ >= this->total_) {
++    this->install_done_(true);
++    return;
++  }
++  switch (this->method_) {
+ #ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-  if (!this->stream_firmware_to_coprocessor_())
+-#else
+-  if (!this->write_embedded_firmware_to_coprocessor_())
++    case UpdateMethod::HTTP:
++      this->defer([this]() { this->read_download_(); });
++      return;
+ #endif
+-  {
+-    this->state_ = prev_state;
+-    this->publish_state();
+-    return;
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++    case UpdateMethod::STORAGE:
++      this->read_storage_();
++      return;
++#endif
++#ifdef USE_ESP32_HOSTED_EMBEDDED_UPDATE
++    case UpdateMethod::EMBEDDED:
++      this->defer([this]() {
++        this->got_ = static_cast<size_t>(std::min<uint64_t>(CHUNK_SIZE, this->total_ - this->offset_));
++        memcpy(this->chunk_, this->firmware_data_ + this->offset_, this->got_);
++        this->on_chunk_();
++      });
++      return;
++#endif
++    default:
++      this->install_done_(false);
++      return;
++  }
++}
++
++void Esp32HostedUpdate::on_chunk_() {
++  this->hasher_.add(this->chunk_, this->got_);
++  std::memcpy(this->image_ + this->offset_, this->chunk_, this->got_);
++  this->offset_ += this->got_;
++  this->publish_progress_();
++  this->next_chunk_();
++}
++
++void Esp32HostedUpdate::install_done_(bool ok) {
++#ifdef USE_ESP32_HOSTED_HTTP_UPDATE
++  if (this->container_ != nullptr) {
++    this->container_->end();
++    this->container_.reset();
++  }
++#endif
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  this->close_stream_();
++#endif
++  if (ok) {
++    // Verify SHA256 over the streamed bytes
++    this->hasher_.calculate();
++    ok = this->hasher_.equals_bytes(this->firmware_sha256_.data());
++    if (!ok) {
++      ESP_LOGE(TAG, "SHA256 mismatch");
++      this->status_set_error(LOG_STR("SHA256 verification failed"));
++    } else {
++      ESP_LOGI(TAG, "SHA256 verified successfully");
++    }
++  }
++  this->finish_install_(ok);
++}
++
++void Esp32HostedUpdate::finish_install_(bool ok) {
++  if (this->chunk_ != nullptr) {
++    RAMAllocator<uint8_t>(RAMAllocator<uint8_t>::ALLOC_EXTERNAL).deallocate(this->chunk_, CHUNK_SIZE);
++    this->chunk_ = nullptr;
++  }
++  this->update_info_.has_progress = false;
++  if (ok) {
++    if (this->app_image_ok_()) {
++#ifdef USE_ESP32_HOSTED_SERIAL
++      this->serial_route_ = false;
++#endif
++      this->slot_query_(true);
++      return;
++    }
++#ifdef USE_ESP32_HOSTED_SERIAL
++    if (this->serial_enabled_ && C6Serial::image_ok(this->image_, static_cast<uint32_t>(this->total_))) {
++      this->serial_route_ = true;
++      this->update_announce_();
++      return;
++    }
++    if (this->serial_enabled_)
++      this->status_set_error(LOG_STR("No C6 factory image"));
++    else
++#endif
++    {
++      ESP_LOGE(TAG, "No app image: the coprocessor is not touched");
++      this->status_set_error(LOG_STR("No app image"));
++    }
+   }
++  this->switch_reset_();
++  this->image_free_();
++  this->busy_ = false;
++  this->state_ = this->prev_state_;
++  this->publish_state();
++  this->progress_trigger_.trigger(-1);
++}
+ 
++void Esp32HostedUpdate::ota_finish_() {
++  this->update_info_.has_progress = false;
++  this->busy_ = false;
+   esp_err_t end_err = ota_end_guarded();
+   if (end_err != ESP_OK) {
+     ESP_LOGE(TAG, "Failed to end OTA: %s", esp_err_to_name(end_err));
+-    this->state_ = prev_state;
++    this->state_ = this->prev_state_;
+     this->status_set_error(LOG_STR("Failed to end OTA"));
+     this->publish_state();
+     return;
+@@ -518,7 +1639,8 @@ void Esp32HostedUpdate::perform(bool force) {
+ #ifdef USE_OTA_ROLLBACK
+   // Mark the host partition as valid before rebooting, in case the safe mode
+   // timer hasn't expired yet.
+-  esp_ota_mark_app_valid_cancel_rollback();
++  if (esp32::system_info::has_otadata())
++    esp_ota_mark_app_valid_cancel_rollback();
+ #endif
+ 
+   // Give the state publish time to reach the API clients, then restart both sides
+diff --git a/esphome/components/esp32_hosted/update/esp32_hosted_update.h b/esphome/components/esp32_hosted/update/esp32_hosted_update.h
+index c319852bff..07ad11c6fa 100644
+--- a/esphome/components/esp32_hosted/update/esp32_hosted_update.h
++++ b/esphome/components/esp32_hosted/update/esp32_hosted_update.h
+@@ -3,58 +3,250 @@
+ #if defined(USE_ESP32_VARIANT_ESP32H2) || defined(USE_ESP32_VARIANT_ESP32P4)
+ 
+ #include "esphome/core/component.h"
++#include "esphome/components/sha256/sha256.h"
+ #include "esphome/components/update/update_entity.h"
+ #include <array>
++#include <memory>
+ #include <string>
+ 
+ #ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+ #include "esphome/components/http_request/http_request.h"
+ #endif
++#ifdef USE_ESP32_HOSTED_UPDATE_NETWORK_EVENT
++#include "esphome/components/network/network_component.h"
++#endif
++
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++#include "esphome/components/storage/storage.h"
++#include "esphome/components/storage/storage_worker.h"
++#include "esphome/components/storage/text_doc.h"
++#endif
++
++#include "esphome/core/automation.h"
++#include "esphome/core/preferences.h"
++#include "esphome/core/static_task.h"
++#include <atomic>
++#include <freertos/FreeRTOS.h>
++#include <freertos/task.h>
++#ifdef USE_ESP32_HOSTED_SERIAL
++#include "c6_serial.h"
++#endif
++#ifdef USE_ESP32_HOSTED_UPDATE_SAFE_MODE
++#include "esphome/components/safe_mode/safe_mode.h"
++#endif
+ 
+ namespace esphome::esp32_hosted {
+ 
+-class Esp32HostedUpdate final : public update::UpdateEntity, public PollingComponent {
++enum class UpdateMethod : uint8_t { EMBEDDED, HTTP, STORAGE };
++
++class Esp32HostedUpdate final : public update::UpdateEntity,
++                                public PollingComponent
++#ifdef USE_ESP32_HOSTED_UPDATE_NETWORK_EVENT
++    ,
++                                public network::ActiveInterfaceListener
++#endif
++{
+  public:
+   void setup() override;
++#ifdef USE_ESP32_HOSTED_UPDATE_NETWORK_EVENT
++  void on_active_interface(network::NetworkInterface interface) override;
++#endif
+   void dump_config() override;
+   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
+ 
+-  void update() override { this->check(); }  // PollingComponent - delegates to check()
++  void update() override;
+   void perform(bool force) override;
+   void check() override;
++  bool is_busy() const { return this->busy_; }
++#if defined(USE_ESP32_HOSTED_SERIAL) && \
++    (defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE))
++  void perform_serial();
++#endif
+ 
++  void set_method(UpdateMethod method) { this->method_ = method; }
++  void set_firmware_sha256(const std::array<uint8_t, 32> &sha256) { this->firmware_sha256_ = sha256; }
+ #ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-  // HTTP mode setters
+   void set_source_url(const char *url) { this->source_url_ = url; }
+   void set_http_request_parent(http_request::HttpRequestComponent *parent) { this->http_request_parent_ = parent; }
+-#else
+-  // Embedded mode setters
++#endif
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  void set_storage_path(const std::string &path);
++  const std::string &get_storage_path() const { return this->storage_path_; }
++#endif
++#ifdef USE_ESP32_HOSTED_EMBEDDED_UPDATE
+   void set_firmware_data(const uint8_t *data) { this->firmware_data_ = data; }
+   void set_firmware_size(size_t size) { this->firmware_size_ = size; }
+-  void set_firmware_sha256(const std::array<uint8_t, 32> &sha256) { this->firmware_sha256_ = sha256; }
++#endif
++  Trigger<float> *get_progress_trigger() { return &this->progress_trigger_; }
++#ifdef USE_ESP32_HOSTED_UPDATE_SAFE_MODE
++  void set_safe_mode(safe_mode::SafeModeComponent *safe_mode) { this->safe_mode_ = safe_mode; }
++#endif
++#ifdef USE_ESP32_HOSTED_SERIAL
++  void set_serial(uint8_t uart_num, int tx_pin, int rx_pin, int boot_pin, uint32_t baud_rate) {
++    this->serial_.set_config(uart_num, tx_pin, rx_pin, boot_pin, baud_rate);
++  }
++  void set_serial_default(bool enabled) { this->serial_enabled_ = enabled; }
++  void set_serial_settings(bool enabled, uint8_t uart_num, int tx_pin, int rx_pin, int boot_pin);
++  bool is_serial_enabled() const { return this->serial_enabled_; }
++  void set_serial_log(bool on);
+ #endif
+ 
+  protected:
++  struct SlotState {
++    uint8_t command;
++    uint8_t result;
++    uint8_t running_subtype;
++    uint8_t boot_subtype;
++    uint8_t minimal;
++    uint8_t other_valid;
++    uint8_t commands;
++    uint8_t table;
++    uint8_t first;
++    uint8_t error_low;
++    uint8_t error_high;
++    uint8_t revision;
++  };
++  void read_version_();
++  void update_announce_();
++  void update_start_();
++  void update_pause_();
++  void update_resume_(bool ok, bool back);
++  static void update_progress_(void *ctx, uint8_t percent);
++  void update_task_free_();
++  static void slot_on_state_(uint32_t msg_id, const uint8_t *data, size_t len, void *ctx);
++  void slot_query_(bool install);
++  void slot_no_answer_();
++  void slot_answered_();
++  bool slot_command_(uint8_t command, uint8_t arg = 0, uint32_t wait_ms = 0);
++  bool hosted_restart_();
++  bool slot_switch_(bool minimal);
++  bool slot_write_();
++  bool offload_offered_() const;
++  bool stock_offered_() const;
++  bool install_with_minimal_();
++  void switch_reset_();
++  void fetch_minimal_();
++  static void slot_task_(void *arg);
++  bool app_image_ok_() const;
++  Trigger<float> progress_trigger_;
++#ifdef USE_ESP32_HOSTED_UPDATE_SAFE_MODE
++  safe_mode::SafeModeComponent *safe_mode_{nullptr};
++  bool normal_after_flash_{false};
++  bool await_safe_{false};
++#endif
++  StaticTask flash_task_;
++  SlotState slot_{};
++  TaskHandle_t slot_waiter_{nullptr};
++  uint8_t *main_image_{nullptr};
++  uint64_t main_total_{0};
++  bool minimal_first_{false};
++  bool slot_install_{false};
++  bool slot_return_{false};
++  bool hosted_up_{true};
++  bool wifi_after_flash_{false};
++#ifdef USE_ESP32_HOSTED_SERIAL
++  struct SerialSettings {
++    uint8_t enabled;
++    uint8_t uart_num;
++    int8_t tx_pin;
++    int8_t rx_pin;
++    int8_t boot_pin;
++  };
++  void serial_settings_load_();
++  bool serial_log_start_();
++  void serial_log_stop_();
++  void serial_log_parked_();
++  static void serial_flash_task_(void *arg);
++  static void serial_log_task_(void *arg);
++  C6Serial serial_;
++  ESPPreferenceObject serial_pref_;
++  StaticTask log_task_;
++  std::atomic<bool> log_stop_{false};
++  std::atomic<bool> log_parked_{false};
++  bool serial_enabled_{false};
++  bool serial_route_{false};
++  bool serial_wanted_{false};
++  bool log_on_{false};
++  bool log_after_flash_{false};
++  bool log_restart_{false};
++#endif
++  void enter_safe_();
++  void safe_install_();
++  void install_failed_(const LogString *what);
++  void begin_install_();
++  void start_ota_();
++  void next_chunk_();
++  void on_chunk_();
++  void install_done_(bool ok);
++  void finish_install_(bool ok);
++  void image_free_();
++  void publish_progress_();
++  void ota_image_start_();
++  void ota_image_step_();
++  void ota_image_failed_(const LogString *what);
++  void ota_finish_();
++
++#if defined(USE_ESP32_HOSTED_HTTP_UPDATE) || defined(USE_ESP32_HOSTED_STORAGE_UPDATE)
++  bool parse_manifest_(const std::string &json_str);
++  void finish_check_();
++  std::string firmware_url_;
++  std::string factory_url_;
++  std::array<uint8_t, 32> factory_sha256_{};
++  bool factory_known_{false};
++  std::string minimal_url_;
++  std::string main_url_;
++  std::array<uint8_t, 32> minimal_sha256_{};
++  std::array<uint8_t, 32> main_sha256_{};
++  bool minimal_known_{false};
++  uint8_t minimal_revision_{0};
++  bool fallback_{false};
++#endif
+ #ifdef USE_ESP32_HOSTED_HTTP_UPDATE
+-  // HTTP mode members
++  void fetch_manifest_();
++  void manifest_step_();
++  void manifest_failed_(const LogString *what);
++  bool open_download_();
++  void read_download_();
+   http_request::HttpRequestComponent *http_request_parent_{nullptr};
+-  const char *source_url_{nullptr};  // literal from codegen
+-  std::string firmware_url_;
+-
+-  // HTTP mode helpers
+-  bool fetch_manifest_();
+-  bool stream_firmware_to_coprocessor_();
++  const char *source_url_{nullptr};
++  std::shared_ptr<http_request::HttpContainer> container_;
++  uint32_t last_data_time_{0};
++  std::string manifest_json_;
+   uint8_t initial_check_remaining_{0};
+-#else
+-  // Embedded mode members
++  bool initial_check_pending_{false};
++  bool checking_{false};
++  bool manifest_reading_{false};
++#endif
++#ifdef USE_ESP32_HOSTED_STORAGE_UPDATE
++  bool is_manifest_() const;
++  storage::PathStorage *open_storage_(const std::string &path, const char **rel, uint64_t *size);
++  void close_stream_();
++  void storage_check_();
++  void storage_check_done_(bool ok, const char *why);
++  bool open_storage_read_();
++  void read_storage_();
++  std::string storage_path_;
++  storage::StreamHandle stream_{};
++  bool stream_open_{false};
++  bool install_after_check_{false};
++#endif
++#ifdef USE_ESP32_HOSTED_EMBEDDED_UPDATE
+   const uint8_t *firmware_data_{nullptr};
+   size_t firmware_size_{0};
+-
+-  // Embedded mode helper
+-  bool write_embedded_firmware_to_coprocessor_();
+ #endif
+ 
++  UpdateMethod method_{UpdateMethod::EMBEDDED};
+   std::array<uint8_t, 32> firmware_sha256_{};
++  sha256::SHA256 hasher_;
++  uint8_t *chunk_{nullptr};
++  uint8_t *image_{nullptr};
++  uint64_t total_{0};
++  uint64_t offset_{0};
++  size_t got_{0};
++  uint32_t last_progress_{0};
++  update::UpdateState prev_state_{update::UPDATE_STATE_UNKNOWN};
++  bool busy_{false};
++  bool force_{false};
+ };
+ 
+ }  // namespace esphome::esp32_hosted
